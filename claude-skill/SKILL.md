@@ -10,6 +10,8 @@ description: 用户已选择模式一时，Claude Code 规划、调度和验收�
 当前 Claude session id：`${CLAUDE_SESSION_ID}`。
 CLI：`@CCL@`。它继承现有 Codex 登录和模型，不需要新 API key。
 
+Windows：以下 heredoc 示例用 Git Bash/Bash 工具执行；如果只使用 PowerShell，请调用同目录的 `ccl.cmd`，用 PowerShell here-string 或 UTF-8 JSON 文件传任务。不要把 Bash heredoc 原样放进 PowerShell。CCL 支持原生 Windows，无需转入 WSL。
+
 用户已要求自动执行：新任务默认 `approval_policy=never` + `sandbox_mode=danger-full-access`，首轮和返修相同。统一使用 ccl new/run，不另开交互式 Codex 终端，不加 `on-request`、`--full-auto` 或默认 `workspace-write` 覆盖该设置。用户明确要求只读/限制目录时才传 `--sandbox read-only|workspace-write`。任务内不逐命令要求 Yes/No。登录失效、操作系统授权、浏览器工具自己的确认要求仍需准确报告。旧任务记录和已运行的交互终端保留原权限，不在运行中更改或重复派发。
 
 ## 开始与规划

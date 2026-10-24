@@ -39,7 +39,7 @@ flowchart TD
 
 ### 1. 准备环境
 
-- Python **3.9+**、Git、POSIX shell。
+- Python **3.9+**、Git；macOS/Linux 使用 POSIX shell，Windows 的 Claude Bash 工具使用 Git Bash。
 - 能独立工作的 **Claude Code CLI** 和 **Codex CLI**，并完成各自登录。
 - Claude 客户端需支持 Claude Code 的本地 skills 和 hooks；普通网页聊天不能直接安装本地 hooks。
 - 本项目不安装模型、不创建 API key，不修改模型或供应商。调用使用各自 CLI 账号的额度或计费方式。
@@ -49,7 +49,7 @@ flowchart TD
 | macOS | 完整 CCL 流程，已有真实 CLI 联调 |
 | Linux | POSIX 实现；提供自动测试与可选 CI 模板，尚未进行真实模型联调 |
 | WSL | 可作为 Linux 环境使用，未单独进行端到端验证 |
-| Windows 原生 | **不能原生运行 CCL**：依赖 `fcntl`、POSIX 进程组和 shell；可用原生 Claude/Codex CLI 直接调用，或由 Mac/Linux 通过 SSH 执行 Windows 任务 |
+| Windows 原生 | **v0.3.0 起支持完整 CCL**：原生 Python、Windows 文件锁、进程树终止、UTF-8 状态及 `.cmd` / Git Bash 启动器，不需要 WSL |
 
 ```bash
 python3 --version
@@ -77,6 +77,17 @@ ccl --version
 git pull --ff-only
 python3 install.py
 ```
+
+Windows 在 PowerShell 中安装：
+
+```powershell
+git clone https://github.com/Yuwangzhi/claude-codex-loop.git
+cd claude-codex-loop
+python -X utf8 install.py
+& "$env:USERPROFILE\.local\bin\ccl.cmd" --version
+```
+
+安装器会将用户 `.local/bin` 加到 Windows 用户 PATH 和 Git Bash 启动配置末尾，保留已有 CLI 的优先级。旧窗口的 PATH 不会热更新：重新打开终端和 Claude Code，或者先使用上面的绝对路径。Windows hooks 直接调用安装时的 Python，不依赖终端能否找到 `ccl`；skills 中的 shell 示例使用 Git Bash。npm 安装的 Codex 通过其 Node 入口启动，避免 `.cmd` 再次解析 JSON 参数。
 
 ### 3. 和 Claude 对话
 
@@ -192,7 +203,7 @@ ssh -o BatchMode=yes YOUR_HOST whoami
 
 `gh auth setup-git` 会将 GitHub HTTPS 的 Git 凭据助手配置为 GitHub CLI。其他托管服务需各自认证。Mac 可访问不代表 Windows 的 token 或 SSH 会话有效；在**实际执行任务的账号与 shell**里验证，不把 token 填进任务、remote URL 或日志。
 
-Windows 原生也可直接在两个 CLI 之间委派；这是 CLI 通路，**不包含 CCL 的状态、自动检查和记忆闭环**：
+Windows 原生现在可以安装完整 CCL；推荐由 Claude 使用 `ccl new/run` 获得同样的状态、独立检查和共享记忆。下面是额外的直接 CLI 调用方式，这种手动通路本身不包含 CCL 闭环：
 
 ```bash
 # Claude 调用 Codex 的基本形式
@@ -208,6 +219,7 @@ CCL worker 不允许再反向调用 Claude，避免无限互调。不同客户�
 
 ```text
 ~/.local/bin/ccl                              启动器
+~/.local/bin/ccl.cmd                          Windows 原生命令入口
 ~/.local/share/claude-codex-loop/              Python 运行文件
 ~/.claude/skills/work-mode/                   两模式入口
 ~/.claude/skills/codex-loop/                  Codex 闭环技能
@@ -221,21 +233,25 @@ CCL worker 不允许再反向调用 Claude，避免无限互调。不同客户�
 
 卸载时先停止 CCL 任务，再删除 CLAUDE.md、AGENTS.md、SHARED_MEMORY.md 中 `BEGIN/END claude-codex-loop` 区块；从 settings 中仅移除指向 CCL 启动器的 hooks；删除两个 skills、启动器和运行文件。任务记录与项目记忆可保留。回退时对照备份 manifest 逐项恢复，避免整体覆盖安装后新改过的设置。
 
+Windows hooks 的命令直接指向 `ccl.py hook`，卸载时只移除这些项；还可移除 Git Bash 配置中 `# CCL user-local executables` 对应行。`.local/bin` 若还有其他工具，不要从 PATH 整体移除。Windows 安装备份额外包含用户 PATH 的原值。
+
 高级变量：`CCL_STATE_DIR` 更改状态目录，`CCL_CONFIG_DIR` 更改共享配置目录，`CCL_CODEX_BIN` 指定 Codex 可执行文件。这些控制执行器运行时，不改变安装器位置；同一流程需使用一致的值。
 
 ## 开发与验证
 
 ```bash
-python3 -m unittest discover -s tests -v
+python3 -X utf8 -m unittest discover -s tests -v
+# Windows: python -X utf8 -m unittest discover -s tests -v
 ```
 
-自动测试不需要模型登录，不发出付费模型调用。覆盖返修、检查失败、产物变化、预算、锁与中断、共享记忆、模式隔离、安装保留设置和失败回退。本地发布验证为 **34/34 通过**；真实模型联调与自动测试的证据边界见 [VALIDATION.md](VALIDATION.md)。
+自动测试不需要模型登录，不发出付费模型调用。覆盖返修、检查失败、产物变化、预算、锁与中断、共享记忆、模式隔离、安装保留设置和失败回退。v0.3.0 在 **macOS 与 Windows 各 38/38 通过**，新增跨进程锁、无副作用 PID 查询、超时子进程终止及 PowerShell 模式门控检查；真实模型联调与自动测试的证据边界见 [VALIDATION.md](VALIDATION.md)。
 
-可选 [GitHub Actions 模板](examples/github-actions.yml) 提供 macOS/Linux × Python 3.9/3.12 矩阵。要启用它，将文件复制到 `.github/workflows/tests.yml` 后提交；提交凭据需要允许写入 workflow。当前仓库没有启用云端 CI，不把本地测试当作云端测试结果。
+可选 [GitHub Actions 模板](examples/github-actions.yml) 提供 macOS/Linux/Windows × Python 3.9/3.12 矩阵。要启用它，将文件复制到 `.github/workflows/tests.yml` 后提交；提交凭据需要允许写入 workflow。当前仓库没有启用云端 CI，不把本地测试当作云端测试结果。
 
 ```text
 ccl.py                任务执行、验证、审查、记忆与 hook 入口
 modes.py              session 模式状态与选择门控
+runtime.py            Windows/POSIX 锁、进程检查和启动兼容层
 install.py            备份、增量安装和失败回退
 claude-skill/         Claude 统筹 / Codex 执行规则
 mode-skill/           两模式选择与收尾规则

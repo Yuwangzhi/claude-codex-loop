@@ -127,6 +127,15 @@ class ModeTests(unittest.TestCase):
                     'ccl mode status --session x > file','ccl mode status --session x\ntouch x']:
             self.assertFalse(modes.control_command(cmd))
 
+    def test_powershell_mode_control_and_dispatch(self):
+        command = '& "C:/Users/example/.local/bin/ccl.cmd" mode status --session session-a'
+        self.assertTrue(modes.control_command(command))
+        self.assertEqual(self.hook('PreToolUse', tool_name='PowerShell', tool_input={'command':command}), {})
+        self.hook('UserPromptSubmit', prompt='模式二')
+        for command in ['& "C:/Users/example/.local/bin/ccl.cmd" run abc', 'codex exec "work"']:
+            response = self.hook('PreToolUse', tool_name='PowerShell', tool_input={'command':command})
+            self.assertEqual(response['hookSpecificOutput']['permissionDecision'], 'deny')
+
 
 if __name__=='__main__':
     unittest.main()

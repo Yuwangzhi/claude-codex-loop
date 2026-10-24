@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -20,7 +21,8 @@ class InstallTests(unittest.TestCase):
         self.bin = self.home / '.local/bin/ccl'
         self.patches = [patch.object(install, 'HOME', self.home),
                         patch.object(install, 'PREFIX', self.prefix),
-                        patch.object(install, 'BIN', self.bin)]
+                        patch.object(install, 'BIN', self.bin),
+                        patch.object(install, 'configure_windows_path')]
         for p in self.patches:
             p.start()
 
@@ -50,9 +52,11 @@ class InstallTests(unittest.TestCase):
             self.assertEqual(len(managed), 1)
         self.assertTrue((folder / 'CLAUDE.md').read_text().startswith('Keep existing guidance.'))
         self.assertEqual((self.prefix / 'ccl.py').read_bytes(), (install.SOURCE / 'ccl.py').read_bytes())
-        result = subprocess.run([str(self.bin), '--version'], capture_output=True, text=True, check=True)
-        self.assertEqual(result.stdout.strip(), '0.2.2')
+        command = ['cmd', '/d', '/c', str(self.bin.with_suffix('.cmd')), '--version'] if os.name == 'nt' else [str(self.bin), '--version']
+        result = subprocess.run(command, capture_output=True, text=True, check=True)
+        self.assertEqual(result.stdout.strip(), '0.3.0')
         self.assertNotIn('@CCL@', (folder / 'skills/codex-loop/SKILL.md').read_text())
+        self.assertNotIn(b'\r\n', self.bin.read_bytes())
 
     def test_failed_install_restores_previous_files(self):
         folder = self.home / '.claude'

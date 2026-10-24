@@ -3,7 +3,6 @@
 import argparse
 import contextlib
 import datetime as dt
-import fcntl
 import hashlib
 import json
 import os
@@ -15,8 +14,9 @@ import sys
 import tempfile
 import uuid
 import modes
+import runtime
 
-VERSION = "0.2.2"
+VERSION = "0.3.0"
 STATE = Path(os.environ.get("CCL_STATE_DIR", str(Path.home() / ".local/state/claude-codex-loop"))).expanduser()
 CONFIG = Path(os.environ.get("CCL_CONFIG_DIR", str(Path.home() / ".config/claude-codex-loop"))).expanduser()
 TERMINAL = {"accepted", "cancelled"}
@@ -86,15 +86,12 @@ def save_task(path, task):
 def lock(project):
     root = bucket(project)
     root.mkdir(parents=True, exist_ok=True)
-    with (root / "project.lock").open("a+") as fd:
+    with contextlib.ExitStack() as stack:
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            stack.enter_context(runtime.file_lock(root / "project.lock", blocking=False))
         except BlockingIOError:
             raise ValueError("Another CCL operation is active in this project; do not duplicate it")
-        try:
-            yield
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+        yield
 
 
 def relative_file(project, name):
@@ -111,11 +108,7 @@ def relative_file(project, name):
 def assert_no_orphan(project):
     for task in tasks_for(project):
         pid = task.get("worker_pid")
-        if pid:
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                continue
+        if pid and runtime.pid_alive(pid):
             raise ValueError("A recorded worker may still be running (PID %s, task %s). Inspect it before retrying; never duplicate side effects." % (pid, task["id"]))
 
 
@@ -210,20 +203,21 @@ def create(project, spec, owner="", attempts=3, sandbox="danger-full-access", ti
 
 def process(argv, cwd, stdin, stdout, stderr, timeout, env=None, on_start=None):
     with stdout.open("wb") as out, stderr.open("wb") as err:
-        p = subprocess.Popen(argv, cwd=str(cwd), stdin=subprocess.PIPE, stdout=out, stderr=err,
-                             start_new_session=True, env=env)
+        p = subprocess.Popen(runtime.executable_argv(argv), cwd=str(cwd), stdin=subprocess.PIPE,
+                             stdout=out, stderr=err, env=env, **runtime.process_options())
         try:
             if on_start:
                 on_start(p.pid)
             p.communicate(stdin.encode() if stdin is not None else None, timeout=timeout)
         except BaseException:
-            os.killpg(p.pid, signal.SIGTERM)
-            try:
-                p.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                os.killpg(p.pid, signal.SIGKILL)
-                p.wait()
+            runtime.terminate_tree(p)
             raise
+        finally:
+            if p.stdin:
+                p.stdin.close()
+            if os.name == 'nt' and p.poll() is not None:
+                # Windows retains process resources until the process handle closes.
+                p._handle.Close()
         return p.returncode
 
 
@@ -309,7 +303,7 @@ def verify(task, attempt, on_start=None):
         out, err = attempt / ("check-%d.out" % index), attempt / ("check-%d.err" % index)
         try:
             rc = process(check["argv"], project, None, out, err, check.get("timeout", 300), on_start=on_start)
-            detail = out.read_text(errors="replace")[-3000:] + err.read_text(errors="replace")[-3000:]
+            detail = out.read_text(encoding="utf-8", errors="replace")[-3000:] + err.read_text(encoding="utf-8", errors="replace")[-3000:]
         except (subprocess.TimeoutExpired, OSError) as e:
             rc, detail = -1, str(e)
         reports.append({"name": check["name"], "passed": rc == 0, "exit_code": rc,
@@ -524,7 +518,7 @@ def native_memory(project, session, text, evidence):
     with lock(project):
         memory = initialize(project)
         token = hashlib.sha256((session + text).encode()).hexdigest()[:16]
-        old = memory.read_text()
+        old = memory.read_text(encoding="utf-8")
         if "<!-- " + token + " -->" not in old:
             atomic(memory, old + "\n<!-- " + token + " -->\n### " + now() + " · Claude 模式二\n\n" + text + "\n\n验证依据：" + evidence + "\n")
     return {"memory": str(memory), "mode": "2", "review": "Claude verified; no Codex review implied"}
@@ -584,6 +578,9 @@ def hook(payload):
 
 
 def main():
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
     os.umask(0o077)
     signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(143))
     parser = argparse.ArgumentParser(description=__doc__)

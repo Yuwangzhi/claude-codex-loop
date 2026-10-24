@@ -51,7 +51,7 @@ class LoopTests(unittest.TestCase):
         self.root = Path(self.tmp.name).resolve()
         self.project = self.root / 'project with spaces'
         self.project.mkdir()
-        self.fake = self.root / 'fake-codex'
+        self.fake = self.root / 'fake-codex.py'
         self.fake.write_text(FAKE)
         self.fake.chmod(0o700)
         self.patches = [patch.object(ccl, 'STATE', self.root/'state'),
@@ -209,8 +209,14 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(self.run_task(task)['state'], 'awaiting_review')
 
     def test_paths_cannot_escape_project_even_with_symlink(self):
-        (self.project/'outside').symlink_to(self.root)
-        for name in ['../escape.txt','outside/escape.txt','/tmp/escape.txt']:
+        names = ['../escape.txt', str(self.root/'escape.txt')]
+        try:
+            (self.project/'outside').symlink_to(self.root, target_is_directory=True)
+            names.append('outside/escape.txt')
+        except OSError:
+            if os.name != 'nt':
+                raise
+        for name in names:
             self.spec['artifacts'] = [name]
             with self.assertRaises(ValueError):
                 self.create()

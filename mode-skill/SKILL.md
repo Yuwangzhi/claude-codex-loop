@@ -6,6 +6,7 @@ description: 在 Claude Code 开始任务、用户选择模式一或模式二、
 # 两种执行模式
 
 当前 session：`${CLAUDE_SESSION_ID}`。管理命令：`@CCL@ mode ... --session '${CLAUDE_SESSION_ID}'`。
+Windows 中这些 shell 示例可用 Git Bash；PowerShell 使用同目录的 `ccl.cmd`（路径含空格时用 `& '完整路径/ccl.cmd'`）。无需 WSL。
 UserPromptSubmit hook 识别用户开头的“模式一”“模式二”“用模式一/二”“我选模式一/二”，等待选择时也识别单独的 `1` 或 `2`。只有真实用户输入能选择；你不能替用户写状态或伪造 hook。原生 AskUserQuestion 的模式选择回答也由 PostToolUse hook 记录。
 
 ## 选择在执行之前

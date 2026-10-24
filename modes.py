@@ -1,13 +1,13 @@
 """Task-scoped, session-isolated choices. No model calls and no implicit default."""
 import contextlib
 import datetime as dt
-import fcntl
 import json
 import os
 from pathlib import Path
 import re
 import shlex
 import tempfile
+import runtime
 
 MENU = "请选择本次执行模式：模式一（1）Claude 统筹、Codex 执行；模式二（2）全部由 Claude 完成。回复 1 或 2，也可以把模式和任务一起说。未选择前不执行。"
 LABELS = {"1": "模式一：Claude 统筹、Codex 执行", "2": "模式二：全部由 Claude 完成"}
@@ -31,22 +31,25 @@ def control_command(command):
         parts = shlex.split(command)
     except ValueError:
         return False
-    if len(parts) < 3 or Path(parts[0]).name != "ccl" or parts[1] != "mode":
+    if parts and parts[0] == '&':
+        parts = parts[1:]
+        command = command.lstrip()[1:]
+    if len(parts) < 3 or Path(parts[0]).name not in ("ccl", "ccl.cmd") or parts[1] != "mode":
         return False
     if parts[2] not in ("status", "activate", "wait", "finish"):
         return False
     # Shell expansion must not turn a status lookup into unrelated execution.
-    return not any(x in command for x in (";", "\n", "&&", "||", "|", "`", "$(", ">", "<"))
+    return not any(x in command for x in (";", "\n", "&", "|", "`", "$(", ">", "<"))
 
 
 def dispatches_codex(tool, args):
     if "codex" in tool.lower() and tool.startswith("mcp"):
         return True
-    if tool != "Bash":
+    if tool not in ("Bash", "PowerShell"):
         return False
     command = args.get("command", "")
     return bool(re.search(r"(?:^|[\s/'\"])codex\s+(?:exec|e|resume|mcp-server)\b", command) or
-                re.search(r"\bccl\s+(?:new|run)\b", command))
+                re.search(r"\bccl(?:\.cmd)?[\"']?\s+(?:new|run)\b", command))
 
 
 class ModeStore:
@@ -62,14 +65,13 @@ class ModeStore:
     def edit(self, session):
         path = self.path(session)
         self.root.mkdir(parents=True, exist_ok=True)
-        with path.with_suffix(".lock").open("a+") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+        with runtime.file_lock(path.with_suffix(".lock")):
             state = self.get(session)
             yield state
             state["updated_at"] = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
             fd, tmp = tempfile.mkstemp(prefix=".mode-", dir=str(self.root))
             try:
-                with os.fdopen(fd, "w") as stream:
+                with os.fdopen(fd, "w", encoding="utf-8") as stream:
                     json.dump(state, stream, ensure_ascii=False, indent=2)
                     stream.flush()
                     os.fsync(stream.fileno())
@@ -81,7 +83,7 @@ class ModeStore:
     def get(self, session):
         path = self.path(session)
         if path.exists():
-            return json.loads(path.read_text())
+            return json.loads(path.read_text(encoding="utf-8"))
         return {"session": session, "mode": None, "phase": "awaiting_choice", "pending_mode": None,
                 "last_mode": None, "history": [], "turn": 0}
 
@@ -163,7 +165,7 @@ class ModeStore:
         state = self.get(session)
         reason = None
         if not state["mode"]:
-            allowed = tool in ("AskUserQuestion", "Skill") or (tool == "Bash" and control_command(args.get("command", "")))
+            allowed = tool in ("AskUserQuestion", "Skill") or (tool in ("Bash", "PowerShell") and control_command(args.get("command", "")))
             if not allowed:
                 reason = "用户要求先选模式再执行。" + MENU
         elif state.get("pending_mode"):
@@ -174,7 +176,7 @@ class ModeStore:
         if reason:
             return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason}}
         if state["phase"] == "ready" and tool not in ("Skill", "AskUserQuestion") and not (
-                tool == "Bash" and control_command(args.get("command", ""))):
+                tool in ("Bash", "PowerShell") and control_command(args.get("command", ""))):
             with self.edit(session) as current:
                 current["phase"] = "working"
         return {}
