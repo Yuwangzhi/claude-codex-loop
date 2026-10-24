@@ -1,0 +1,15 @@
+{
+  "title": "Create a minimal status report",
+  "goal": "Create report.json containing status=ok and items=3 in this example workspace.",
+  "plan": "Write the requested JSON, read it back, and run the acceptance check.",
+  "acceptance": ["report.json parses as JSON and contains the exact requested values"],
+  "constraints": ["Only modify report.json. Do not commit, push, or change any remote state."],
+  "artifacts": ["report.json"],
+  "checks": [
+    {
+      "name": "Check report contents",
+      "argv": ["python3", "-c", "import json; d=json.load(open('report.json')); assert d == {'status': 'ok', 'items': 3}"],
+      "timeout": 10
+    }
+  ]
+}

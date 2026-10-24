@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.DS_Store
+.ai-collab/
+.env
+.env.*
+!.env.example
+*.log
+*.jsonl
+.venv/
+private/
+ACCESS_HANDOFF.md
