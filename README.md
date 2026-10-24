@@ -4,6 +4,8 @@
 
 **只和 Claude 对话，让 Claude 定方案、Codex 干活，最后由 Claude 验收。也可以选择全部由 Claude 完成。**
 
+![Claude–Codex Loop：Claude 统筹，Codex 执行，共享项目上下文](docs/claude-codex-loop-promo-20261024.png)
+
 A local, two-mode workflow for Claude Code and Codex CLI: plan → execute → verify → repair → review → shared memory. Python standard library only; uses your existing CLI authentication.
 
 适合 Claude 额度较少、Codex 额度较多，又希望保留 Claude 统筹体验的个人工作流。将大规模执行交给 Codex，可以减少 Claude 承担的执行工作；实际额度消耗取决于任务规模、上下文和返修次数，不承诺固定节省比例。
