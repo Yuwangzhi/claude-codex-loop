@@ -16,7 +16,7 @@ import uuid
 import modes
 import runtime
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 STATE = Path(os.environ.get("CCL_STATE_DIR", str(Path.home() / ".local/state/claude-codex-loop"))).expanduser()
 CONFIG = Path(os.environ.get("CCL_CONFIG_DIR", str(Path.home() / ".config/claude-codex-loop"))).expanduser()
 TERMINAL = {"accepted", "cancelled"}
@@ -528,16 +528,30 @@ def summary(task):
     return {k: task.get(k) for k in ["id", "project", "state", "attempts", "max_attempts", "thread_id", "feedback", "result", "verification"]} | {"records": str(task_path(task["id"]))}
 
 
+def find_transcript(session):
+    modes.ModeStore(STATE).path(session)
+    root = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude"))).expanduser() / "projects"
+    found = sorted(root.glob("*/" + session + ".jsonl"), key=lambda p: p.stat().st_mtime)
+    if not found:
+        raise ValueError("Transcript not found for session " + session + "; pass --transcript")
+    return found[-1]
+
+
 def hook(payload):
     project = project_dir(payload["cwd"])
     session = payload["session_id"]
     store = modes.ModeStore(STATE)
     event = payload.get("hook_event_name")
+    if payload.get("ccl_transport") == "module":
+        # Store health metadata only, never prompts or tool arguments.
+        with store.edit(session) as state:
+            state["hook_transport"] = "module"
+            state["hook_seen_at"] = modes.now()
+            state.setdefault("hook_events", {})[event] = modes.now()
     own = owned_tasks(session)
     tasks = [t for t in tasks_for(project) if t["state"] not in TERMINAL]
     if event == "SessionStart":
-        with store.edit(session):
-            pass
+        store.hook_seen(session)
         state = store.get(session)
         info = [{"id": t["id"], "state": t["state"], "title": t["spec"]["title"]} for t in tasks[:5]]
         return {"systemMessage": modes.LABELS[state["mode"]] if state["mode"] else modes.MENU,
@@ -553,13 +567,21 @@ def hook(payload):
                 "CCL 模式状态（来自用户输入，不可自行选择）session=" + session + "；" + store.guidance(state) + access}}
     if event == "PostToolUse" and payload.get("tool_name") == "AskUserQuestion":
         questions = payload.get("tool_input", {}).get("questions", [])
-        is_mode = any("模式一" in q.get("question", "") and "模式二" in q.get("question", "") for q in questions)
+        asked = {q.get("question", "") for q in questions if modes.has_menu(q.get("question", ""))}
         response = payload.get("tool_response", {})
-        if is_mode and isinstance(response, dict):
-            for answer in response.get("answers", {}).values():
+        if asked and isinstance(response, dict):
+            answers = response.get("answers", {})
+            answers = answers if isinstance(answers, dict) else {}
+            for question in asked:
+                answer = answers.get(question, "")
                 if isinstance(answer, str) and modes.parse_choice(answer):
-                    state = store.submitted(session, answer, own)
-                    return {"hookSpecificOutput": {"hookEventName": event, "additionalContext": store.guidance(state)}}
+                    state = store.submitted(session, answer, own, choice_context=True)
+                    break
+            else:
+                # Skipping the mode question, or answering without a choice,
+                # follows the user's stored preference when one exists.
+                state = store.submitted(session, "", own, choice_context=True)
+            return {"hookSpecificOutput": {"hookEventName": event, "additionalContext": store.guidance(state)}}
         return {}
     if event == "PreToolUse":
         return store.pretool(session, payload.get("tool_name", ""), payload.get("tool_input", {}))
@@ -611,10 +633,11 @@ def main():
     ctx.add_argument("--project", default=".")
     sub.add_parser("hook")
     mode = sub.add_parser("mode")
-    mode.add_argument("action", choices=["status", "begin", "wait", "finish", "activate"])
+    mode.add_argument("action", choices=["status", "begin", "wait", "finish", "activate", "sync"])
     mode.add_argument("--session", required=True)
     mode.add_argument("--project", default=".")
     mode.add_argument("--note", default="")
+    mode.add_argument("--transcript", default="", help="sync only; default: locate session transcript under Claude projects")
     transfer = sub.add_parser("adopt")
     transfer.add_argument("task")
     transfer.add_argument("--session", required=True)
@@ -629,6 +652,10 @@ def main():
             store = modes.ModeStore(STATE)
             if args.action == "status":
                 output = store.get(args.session)
+                output["hooks_seen"] = bool(output.get("hook_seen_at"))
+            elif args.action == "sync":
+                transcript = Path(args.transcript).expanduser() if args.transcript else find_transcript(args.session)
+                output = store.sync(args.session, transcript, owned_tasks(args.session))
             elif args.action == "begin":
                 output = store.begin(args.session, project_dir(args.project), args.note)
             elif args.action == "wait":

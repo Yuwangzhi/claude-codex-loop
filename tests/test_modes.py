@@ -66,23 +66,223 @@ class ModeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.store.require(self.session,'1')
 
-    def test_finish_clears_mode_and_future_task_waits_again(self):
+    def test_finish_clears_mode_and_future_task_inherits_last_mode(self):
         self.hook('UserPromptSubmit',prompt='模式二')
         self.store.begin(self.session,self.project,'task')
         self.store.finish(self.session,'verified file',[])
-        self.hook('UserPromptSubmit',prompt='再帮我做另一个任务')
-        state=self.store.get(self.session)
-        self.assertIsNone(state['mode'])
-        self.assertEqual(state['last_mode'],'2')
+        self.assertIsNone(self.store.get(self.session)['mode'])
         reminder=self.hook('Stop',last_assistant_message='完成')
         self.assertEqual(reminder['decision'],'block')
         self.assertEqual(self.hook('Stop',last_assistant_message='完成',stop_hook_active=True),{})
         self.assertEqual(self.hook('Stop',last_assistant_message='模式一还是模式二？'),{})
+        self.hook('UserPromptSubmit',prompt='再帮我做另一个任务')
+        state=self.store.get(self.session)
+        self.assertEqual(state['mode'],'2')
+        self.assertEqual(state['last_mode'],'2')
+        self.assertEqual(state['selection_source'],'default_last_mode')
+        self.assertIn('沿用',self.store.guidance(state))
+        self.assertEqual(self.hook('PreToolUse',tool_name='Write',tool_input={}),{})
+
+    def test_informal_choices(self):
+        for prompt in ['1','一','模式1','模式一','模式 １','一吧','用1','就用一吧','那就模式1吧','我觉得模式一吧','模式1：不要删除文件']:
+            with self.subTest(prompt=prompt):
+                self.assertEqual(modes.parse_choice(prompt),'1')
+        for prompt in ['2','二','模式2','模式二','２','二吧','那就2吧','还是二','这次用模式二','模式二：仅 Claude','我想选2']:
+            with self.subTest(prompt=prompt):
+                self.assertEqual(modes.parse_choice(prompt),'2')
+
+    def test_numbers_mentions_negation_and_ambiguous_answers_are_not_choices(self):
+        for prompt in ['看一下','再试一次','有2个错误','跑1次','12','模式12','模式一二','模式1或2',
+                       '模式一和模式二','模式1 / 模式2','不要用模式一','不选2','不是模式二',
+                       '模式一还是模式二？','解释模式二','模式一可以吗','在文件里写模式二','随便','沿用上次']:
+            with self.subTest(prompt=prompt):
+                self.assertIsNone(modes.parse_choice(prompt))
+
+    def test_new_session_inherits_preference_without_changing_active_sessions(self):
+        self.store.submitted('session-a','模式一',[])
+        self.store.submitted('session-b','帮我修复文件',[])
+        self.assertEqual(self.store.get('session-b')['mode'],'1')
+        self.store.submitted('session-c','模式二',[])
+        self.assertEqual(self.store.get('session-a')['mode'],'1')
+        self.assertEqual(self.store.get('session-b')['mode'],'1')
+        self.store.submitted('session-d','继续',[])
+        self.assertEqual(self.store.get('session-d')['mode'],'2')
+
+    def test_session_last_mode_wins_over_another_session_preference(self):
+        self.store.submitted('session-a','模式一',[])
+        self.store.finish('session-a','done',[])
+        self.store.submitted('session-b','模式二',[])
+        self.store.submitted('session-a','再来一个任务',[])
+        self.assertEqual(self.store.get('session-a')['mode'],'1')
+
+    def test_existing_installation_migrates_last_saved_choice(self):
+        with self.store.edit('legacy') as state:
+            state.update(mode=None,last_mode='2',phase='awaiting_choice',selection_source='transcript_sync')
+        state=self.store.submitted(self.session,'继续执行',[])
+        self.assertEqual(state['mode'],'2')
+        self.assertEqual(state['selection_source'],'default_last_mode')
+
+    def test_legacy_state_without_choice_evidence_does_not_set_default(self):
+        with self.store.edit('synthetic') as state:
+            state.update(mode=None,last_mode='2',phase='awaiting_choice')
+        self.assertIsNone(self.store.submitted(self.session,'继续执行',[])['mode'])
+
+    def test_session_start_shows_inherited_preference_without_consuming_task(self):
+        self.store.submitted('previous','模式二',[])
+        response=self.hook('SessionStart')
+        self.assertIn('上次为模式二',response['hookSpecificOutput']['additionalContext'])
+        self.assertIn('不必等待确认',response['hookSpecificOutput']['additionalContext'])
+        self.assertIsNone(self.store.get(self.session)['mode'])
+
+    def test_unanswered_native_mode_question_defaults_to_history(self):
+        self.store.submitted('previous','模式二',[])
+        response=self.hook('PostToolUse',tool_name='AskUserQuestion',
+            tool_input={'questions':[{'question':'模式1还是模式2？'}]},tool_response={'answers':{}})
+        self.assertEqual(self.store.get(self.session)['mode'],'2')
+        self.assertIn('沿用',response['hookSpecificOutput']['additionalContext'])
+
+    def test_unanswered_first_mode_question_still_needs_real_choice(self):
+        self.hook('PostToolUse',tool_name='AskUserQuestion',
+            tool_input={'questions':[{'question':'模式1还是模式2？'}]},tool_response={'answers':{}})
+        self.assertIsNone(self.store.get(self.session)['mode'])
+
+    def test_native_numeric_answer_can_change_active_mode(self):
+        self.store.submitted(self.session,'模式一',[])
+        self.store.begin(self.session,self.project,'work')
+        question='模式1还是模式2？'
+        self.hook('PostToolUse',tool_name='AskUserQuestion',
+            tool_input={'questions':[{'question':question}]},tool_response={'answers':{question:'二吧'}})
+        self.assertEqual(self.store.get(self.session)['mode'],'2')
+
+    def test_default_can_be_overridden_before_work_but_numbers_in_work_are_not_choices(self):
+        self.store.submitted('old','模式二',[])
+        self.store.submitted(self.session,'帮我修复文件',[])
+        self.store.submitted(self.session,'1',[])
+        self.assertEqual(self.store.get(self.session)['mode'],'1')
+        self.store.begin(self.session,self.project,'work')
+        self.store.submitted(self.session,'2',[])
+        self.assertEqual(self.store.get(self.session)['mode'],'1')
+
+    def test_defaulted_mode_accepts_bare_switch_during_work(self):
+        self.store.submitted('previous','模式二',[])
+        self.store.submitted(self.session,'继续',[])
+        self.store.begin(self.session,self.project,'work')
+        self.store.submitted(self.session,'一吧',[])
+        self.assertEqual(self.store.get(self.session)['mode'],'1')
+
+    def transcript(self, records):
+        path=self.project/'transcript.jsonl'
+        path.write_text('\n'.join(json.dumps(x,ensure_ascii=False) for x in records)+'\n',encoding='utf-8')
+        return path
+
+    def user_record(self, text, stamp='2026-01-01T00:00:01.000Z', **kwargs):
+        return dict(type='user',timestamp=stamp,uuid=stamp,message={'content':text},origin={'kind':'human'},**kwargs)
+
+    def test_sync_recovers_menu_answer_from_real_human(self):
+        path=self.transcript([
+            {'type':'assistant','message':{'content':[{'type':'text','text':'请选择模式 1 或模式 2'}]}},
+            self.user_record('二吧'),
+        ])
+        state=self.store.sync(self.session,path,[])
+        self.assertEqual(state['mode'],'2')
+        self.assertEqual(state['selection_source'],'transcript_sync')
+        self.assertEqual(state['selection_evidence']['source'],'user_prompt')
+
+    def test_sync_ignores_tools_meta_and_unprompted_bare_numbers(self):
+        path=self.transcript([
+            self.user_record('帮我检查文件'),
+            {'type':'assistant','message':{'content':[{'type':'text','text':'要检查几个文件？'}]}},
+            self.user_record('1'),
+            self.user_record('模式二',isMeta=True),
+            {'type':'user','message':{'content':'模式二'},'origin':{'kind':'tool'}},
+            {'type':'user','message':{'content':[{'type':'tool_result','content':'模式二'}]}},
+        ])
+        with self.assertRaises(ValueError):
+            self.store.sync(self.session,path,[])
+
+    def test_sync_accepts_bare_first_choice(self):
+        path=self.transcript([self.user_record('二吧')])
+        self.assertEqual(self.store.sync(self.session,path,[])['mode'],'2')
+
+    def test_sync_accepts_bare_override_of_defaulted_mode(self):
+        self.store.submitted('previous','模式二',[])
+        with patch.object(modes,'now',return_value='2026-01-01T00:00:01.000Z'):
+            self.store.submitted(self.session,'继续',[])
+        self.store.begin(self.session,self.project,'work')
+        path=self.transcript([
+            {'type':'assistant','message':{'content':[{'type':'text','text':'本次沿用上次方式'}]}},
+            self.user_record('1','2026-01-01T00:00:02.000Z')])
+        self.assertEqual(self.store.sync(self.session,path,[])['mode'],'1')
+
+    def test_sync_native_question_uses_numeric_menu_and_matched_answer(self):
+        question='本次用模式1还是模式2？'
+        path=self.transcript([{'type':'user','timestamp':'2026-01-01T00:00:01.000Z',
+            'toolUseResult':{'questions':[{'question':question}], 'answers':{question:'那就2吧'}}}])
+        self.assertEqual(self.store.sync(self.session,path,[])['mode'],'2')
+
+    def test_sync_after_finish_does_not_replay_old_selection(self):
+        path=self.transcript([self.user_record('模式一')])
+        self.store.sync(self.session,path,[])
+        self.store.finish(self.session,'done',[])
+        state=self.store.sync(self.session,path,[])
+        self.assertEqual(state['mode'],'1')
+        self.assertEqual(state['selection_source'],'default_last_mode')
+
+    def test_sync_detects_new_explicit_switch_and_preserves_worker_handoff(self):
+        with patch.object(modes,'now',return_value='2026-01-01T00:00:01.000Z'):
+            self.store.submitted(self.session,'模式一',[])
+        path=self.transcript([self.user_record('模式二','2026-01-01T00:00:02.000Z')])
+        state=self.store.sync(self.session,path,[{'id':'running'}])
+        self.assertEqual(state['mode'],'1')
+        self.assertEqual(state['pending_mode'],'2')
+        self.assertEqual(self.store.sync(self.session,path,[{'id':'running'}])['pending_mode'],'2')
+
+    def test_session_start_marker_does_not_hide_unrecorded_choice(self):
+        self.store.hook_seen(self.session)
+        path=self.transcript([self.user_record('模式二')])
+        self.assertEqual(self.store.sync(self.session,path,[])['mode'],'2')
 
     def test_just_selecting_mode_does_not_consume_it(self):
         self.hook('UserPromptSubmit',prompt='2')
         self.assertEqual(self.hook('Stop',last_assistant_message='已选择模式二，请说任务'),{})
         self.assertEqual(self.store.get(self.session)['mode'],'2')
+
+    def test_desktop_metadata_can_close_turn_after_mode_finish(self):
+        self.store.submitted(self.session,'模式二',[])
+        self.store.begin(self.session,self.project,'work')
+        self.store.finish(self.session,'verified',[])
+        for tool in ['mcp__ccd_turn__wrap_up','mcp__ccd_turn__update_plan']:
+            with self.subTest(tool=tool):
+                self.assertEqual(self.hook('PreToolUse',tool_name=tool,tool_input={'recap':'done'}),{})
+                state=self.store.get(self.session)
+                self.assertIsNone(state['mode'])
+                self.assertEqual(state['phase'],'awaiting_choice')
+        for tool in ['mcp__ccd_turn__execute','mcp__ccd_turn__wrap_up_extra','mcp__other__wrap_up']:
+            with self.subTest(tool=tool):
+                response=self.hook('PreToolUse',tool_name=tool,tool_input={})
+                self.assertEqual(response['hookSpecificOutput']['permissionDecision'],'deny')
+
+    def test_desktop_metadata_does_not_begin_ready_task(self):
+        self.store.submitted(self.session,'模式二',[])
+        for tool in ['mcp__ccd_turn__wrap_up','mcp__ccd_turn__update_plan']:
+            self.assertEqual(self.hook('PreToolUse',tool_name=tool,tool_input={}),{})
+            self.assertEqual(self.store.get(self.session)['phase'],'ready')
+
+    def test_stop_accepts_desktop_numeric_and_abbreviated_mode_reminders(self):
+        self.store.submitted(self.session,'模式二',[])
+        self.store.finish(self.session,'verified',[])
+        for message in [
+            '下一项任务可选 1（Claude＋Codex）或 2（仅 Claude）；不选就沿用本次模式。',
+            '下一项任务可选 **1（Claude + Codex）** 或 **2（仅 Claude）**；不选就沿用本次模式。',
+            '下一项可选模式一或二，不选就沿用本次模式。',
+            '下一项可选模式1或2，不选就沿用本次模式。',
+        ]:
+            with self.subTest(message=message):
+                self.assertTrue(modes.has_menu(message))
+                self.assertEqual(self.hook('Stop',last_assistant_message=message),{})
+                self.assertNotIn('reminder_sent',self.store.get(self.session))
+        for message in ['完成了 1 个 Claude 测试和 2 个 Codex 测试','下一项可选 1 个或 2 个文件']:
+            self.assertFalse(modes.has_menu(message))
 
     def test_sessions_are_isolated(self):
         self.store.submitted('session-a','模式一',[])

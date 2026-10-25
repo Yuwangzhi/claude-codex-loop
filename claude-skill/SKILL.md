@@ -1,11 +1,11 @@
 ---
 name: codex-loop
-description: 用户已选择模式一时，Claude Code 规划、调度和验收，由本地 Codex 执行代码、文档、论文、数据分析等任务并返修。未选模式先用 work-mode；模式二禁止使用此执行器。
+description: 当前执行方式为模式一时，由 Claude Code 规划、调度和验收，本地 Codex 执行任务并返修。模式未确定时先用 work-mode 读取用户选择或历史偏好；模式二不使用此执行器。
 ---
 
 # Claude 统筹，Codex 执行
 
-先确认 work-mode 状态为模式一；未选择时先展示两种模式等待用户，模式二则由 Claude 自己完成。用户只与你对话。模式一由你确定方向和验收标准，具体工作交给 Codex；不要先让多个 Claude 子代理重复探索/执行。同一任务内沿用已有选择和授权，不在每次交接时重新询问。
+先确认 work-mode 状态为模式一，可以来自用户本次选择，也可以按约定沿用上次模式。状态缺失时按 work-mode 用 `ccl mode sync` 恢复真实选择或历史偏好；从无记录时才展示两种模式等待用户。模式二由 Claude 自己完成。用户只与你对话。模式一由你确定方向和验收标准，具体工作交给 Codex；不要先让多个 Claude 子代理重复探索/执行。同一任务内沿用已有选择和授权，不在每次交接时重新询问。
 
 当前 Claude session id：`${CLAUDE_SESSION_ID}`。
 CLI：`@CCL@`。它继承现有 Codex 登录和模型，不需要新 API key。
@@ -49,7 +49,7 @@ CCL_SPEC
 `@CCL@ status TASK_ID` 返回状态、简短结果、检查、sha256、工具调用数/usage所在的记录路径。详情按需读 `status TASK_ID --full` 或 records 下的文件，不把完整事件日志塞回对话。
 
 - `awaiting_review`：自动检查通过，仍待你验收。查看实际 diff/产物和检查日志，核对原始目标与授权。重要视觉产物需要实际渲染或打开查看；外部任务需要相应外部状态证据。程序会在接受时再次核对产物指纹和 Git 状态。
-- 合格：`@CCL@ review TASK_ID accept --note '实际看了哪些文件/结果，为什么满足哪些验收条件'`。有用经验写入记忆后，按 work-mode 的 mode finish 关闭本次模式，再向用户报告结果并提示下一项任务选择模式一或模式二。
+- 合格：`@CCL@ review TASK_ID accept --note '实际看了哪些文件/结果，为什么满足哪些验收条件'`。有用经验写入记忆后，按 work-mode 的 mode finish 关闭本次任务状态、保留历史模式，再向用户报告结果并提示“下一项任务可选 1 或 2，不选就沿用本次模式”。
 - 有具体问题：`@CCL@ review TASK_ID revise --note '问题位置、证据和修复要求'`，再 `@CCL@ run TASK_ID`。无需让用户再次批准已授权的修复。
 - `blocked/execution_failed/interrupted/budget_exhausted`：看证据并判断能否解决。预算耗尽后先改变计划，确有必要才新建任务并引用旧记录，不能通过新建任务绕过停机条件。用户决定或权限缺失时明确说明具体阻碍。不能把未验收称为已完成。
 - 用户取消：`@CCL@ review TASK_ID cancel --note '用户取消/变更目标'`。运行中先终止并等待对应 Bash 后台任务退出；不要盲杀全部 Codex 进程。
