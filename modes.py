@@ -128,6 +128,25 @@ def control_command(command):
     return not any(x in command for x in (";", "\n", "&", "|", "`", "$(", ">", "<"))
 
 
+def diagnostic_command(command):
+    """Standalone read-only diagnosis is available even during state repair."""
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return False
+    if parts and parts[0] == '&':
+        parts = parts[1:]
+        command = command.lstrip()[1:]
+    if len(parts) < 2 or Path(parts[0]).name not in ('ccl', 'ccl.cmd'):
+        return False
+    if any(x in command for x in (';', '\n', '\r', '&', '|', '`', '$', '>', '<')):
+        return False
+    if parts[1] == 'doctor':
+        rest = parts[2:]
+        return len(rest) % 2 == 0 and all(rest[i] in ('--project', '--session') for i in range(0, len(rest), 2))
+    return len(parts) == 3 and parts[1] == 'recover' and bool(re.fullmatch(r'[0-9a-f]{12}', parts[2]))
+
+
 def dispatches_codex(tool, args):
     if "codex" in tool.lower() and tool.startswith("mcp"):
         return True
@@ -170,7 +189,13 @@ class ModeStore:
     def get(self, session):
         path = self.path(session)
         if path.exists():
-            return json.loads(path.read_text(encoding="utf-8"))
+            state = json.loads(path.read_text(encoding="utf-8"))
+            if (not isinstance(state, dict) or state.get("mode") not in (None, "1", "2") or
+                    state.get("pending_mode") not in (None, "1", "2") or
+                    state.get("phase") not in ("awaiting_choice", "ready", "working", "waiting_input", "switch_pending") or
+                    not isinstance(state.get("history", []), list) or type(state.get("turn", 0)) is not int):
+                raise ValueError("Invalid mode state structure: " + str(path))
+            return state
         return {"session": session, "mode": None, "phase": "awaiting_choice", "pending_mode": None,
                 "last_mode": None, "history": [], "turn": 0}
 

@@ -15,8 +15,9 @@ import tempfile
 import uuid
 import modes
 import runtime
+import diagnostics
 
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 STATE = Path(os.environ.get("CCL_STATE_DIR", str(Path.home() / ".local/state/claude-codex-loop"))).expanduser()
 CONFIG = Path(os.environ.get("CCL_CONFIG_DIR", str(Path.home() / ".config/claude-codex-loop"))).expanduser()
 TERMINAL = {"accepted", "cancelled"}
@@ -53,7 +54,7 @@ def atomic(path, text):
 
 
 def read_json(path):
-    return json.loads(path.read_text(encoding="utf-8"))
+    return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
 def project_dir(project):
@@ -66,6 +67,30 @@ def project_dir(project):
 def bucket(project):
     key = hashlib.sha256(str(project).encode()).hexdigest()[:20]
     return STATE / "projects" / key
+
+
+def read_task(path):
+    task = read_json(path)
+    if (not isinstance(task, dict) or task.get("id") != path.parent.name or
+            not isinstance(task.get("project"), str) or not Path(task["project"]).is_absolute() or
+            not isinstance(task.get("state"), str) or not isinstance(task.get("spec"), dict) or
+            not isinstance(task["spec"].get("title"), str) or
+            type(task.get("attempts")) is not int or type(task.get("max_attempts")) is not int or
+            not isinstance(task.get("updated_at", ""), str) or
+            not isinstance(task.get("owner_session", ""), str) or
+            not isinstance(task.get("verification_records", ""), str) or
+            not isinstance(task.get("history", []), list) or
+            not all(isinstance(item, dict) for item in task.get("history", [])) or
+            bucket(Path(task["project"])) != path.parents[2]):
+        raise ValueError("Invalid task record structure or project identity: " + str(path))
+    if "result" in task:
+        validate_result(task["result"])
+    if "verification" in task:
+        value = task["verification"]
+        if (not isinstance(value, dict) or not isinstance(value.get("artifact_hashes"), dict) or
+                not isinstance(value.get("git"), dict) or not isinstance(value.get("checks"), list)):
+            raise ValueError("Invalid verification record: " + str(path))
+    return task
 
 
 def task_path(task_id):
@@ -121,18 +146,26 @@ def file_hash(path):
 
 
 def git_snapshot(project):
-    def git(*args):
-        p = subprocess.run(["git", "-C", str(project), *args], capture_output=True, timeout=30)
+    base = project
+    def git(*args, required=False):
+        p = subprocess.run(["git", "-C", str(base), *args], capture_output=True, timeout=30)
+        if required and p.returncode:
+            raise ValueError("Git snapshot failed (" + " ".join(args) + "): " + p.stderr.decode("utf-8", errors="replace")[:1000])
         return p.returncode, p.stdout
     code, root = git("rev-parse", "--show-toplevel")
     if code:
         return {"available": False}
-    _, status = git("status", "--porcelain=v1", "-z")
-    _, diff = git("diff", "--no-ext-diff", "--binary")
-    _, staged = git("diff", "--cached", "--no-ext-diff", "--binary")
-    _, head = git("rev-parse", "HEAD")
-    _, untracked = git("ls-files", "--others", "--exclude-standard", "-z")
+    # All paths and diffs must use the same root, including nested projects.
     base = Path(os.fsdecode(root).strip())
+    _, status = git("status", "--porcelain=v1", "-z", required=True)
+    _, diff = git("diff", "--no-ext-diff", "--binary", required=True)
+    _, staged = git("diff", "--cached", "--no-ext-diff", "--binary", required=True)
+    code, head = git("rev-parse", "--verify", "--quiet", "HEAD")
+    if code:
+        # An unborn branch is valid; other failed snapshot commands are not.
+        _, branch = git("symbolic-ref", "--quiet", "HEAD", required=True)
+        head = b"unborn:" + branch
+    _, untracked = git("ls-files", "--others", "--exclude-standard", "-z", required=True)
     hashes = {}
     for name in untracked.split(b"\0"):
         if name:
@@ -231,6 +264,8 @@ def parse_events(path):
                 event = json.loads(line)
             except ValueError:
                 continue
+            if not isinstance(event, dict):
+                continue
             kind = event.get("type")
             if kind == "thread.started":
                 result["thread_id"] = event.get("thread_id")
@@ -239,7 +274,7 @@ def parse_events(path):
                 result["usage"] = event.get("usage", {})
             elif kind in ("turn.failed", "error"):
                 result["failed"] = True
-            elif kind == "item.completed" and event.get("item", {}).get("type") in (
+            elif kind == "item.completed" and isinstance(event.get("item"), dict) and event["item"].get("type") in (
                     "command_execution", "file_change", "mcp_tool_call", "web_search", "tool_call"):
                 result["tool_items"] += 1
     return result
@@ -301,13 +336,20 @@ def verify(task, attempt, on_start=None):
             artifacts[name] = file_hash(p)
     for index, check in enumerate(task["spec"].get("checks", [])):
         out, err = attempt / ("check-%d.out" % index), attempt / ("check-%d.err" % index)
+        failure_kind = None
         try:
             rc = process(check["argv"], project, None, out, err, check.get("timeout", 300), on_start=on_start)
             detail = out.read_text(encoding="utf-8", errors="replace")[-3000:] + err.read_text(encoding="utf-8", errors="replace")[-3000:]
-        except (subprocess.TimeoutExpired, OSError) as e:
+        except subprocess.TimeoutExpired as e:
+            rc, detail, failure_kind = -1, str(e), "timeout"
+        except OSError as e:
             rc, detail = -1, str(e)
+            failure_kind = "environment"
         reports.append({"name": check["name"], "passed": rc == 0, "exit_code": rc,
-                        "detail": detail, "stdout": str(out), "stderr": str(err)})
+                        "detail": detail, "stdout": str(out), "stderr": str(err),
+                        "failure_kind": failure_kind or ("check_failed" if rc else None)})
+        if failure_kind:
+            break  # Do not spend worker quota or execute later checks blindly.
     # Capture hashes AFTER checks, since builds/formatters can alter artifacts.
     for name in list(artifacts):
         p = relative_file(project, name)
@@ -316,6 +358,7 @@ def verify(task, attempt, on_start=None):
         else:
             reports.append({"name": "artifact " + name, "passed": False, "detail": "Removed during checks"})
     result = {"passed": all(r["passed"] for r in reports), "checks": reports,
+              "blocking_failure": any(r.get("failure_kind") in ("environment", "timeout") for r in reports),
               "artifact_hashes": artifacts, "git": git_snapshot(project),
               "automated_check_count": len(task["spec"].get("checks", [])), "verified_at": now()}
     atomic(attempt / "verification.json", dump(result))
@@ -324,13 +367,13 @@ def verify(task, attempt, on_start=None):
 
 def run_task(task_id):
     path = task_path(task_id)
-    initial = read_json(path / "task.json")
+    initial = read_task(path / "task.json")
     project = Path(initial["project"])
     if initial.get("owner_session"):
         modes.ModeStore(STATE).require(initial["owner_session"], "1")
     with lock(project):
         assert_no_orphan(project)
-        task = read_json(path / "task.json")
+        task = read_task(path / "task.json")
         if task.get("recovery_required"):
             raise ValueError("Inspect interrupted task evidence, then use review revise with recovery instructions")
         if task["state"] in ("running", "verifying"):
@@ -357,6 +400,10 @@ def run_task(task_id):
                     save_task(path, task)
                     return task
             task["attempts"] += 1
+            # A failed new attempt must not expose the previous candidate as current.
+            task.pop("result", None)
+            task.pop("verification", None)
+            task.pop("verification_records", None)
             attempt = path / ("attempt-%02d" % task["attempts"])
             attempt.mkdir()
             atomic(attempt / "schema.json", dump(RESULT_SCHEMA))
@@ -398,6 +445,7 @@ def run_task(task_id):
                 save_task(path, task)
                 return task
             task["result"] = result
+            task["result_attempt"] = task["attempts"]
             if result["outcome"] == "blocked" or result["blockers"]:
                 task["state"] = "blocked"
                 task["feedback"] = result["summary"] + "\n" + "\n".join(result["blockers"])
@@ -412,8 +460,19 @@ def run_task(task_id):
                 task.pop("worker_pid", None)
                 save_task(path, task)
                 raise
+            except (ValueError, OSError, subprocess.TimeoutExpired) as e:
+                task["state"] = "blocked"
+                task["feedback"] = "Verification could not complete: " + str(e)
+                task.pop("worker_pid", None)
+                save_task(path, task)
+                return task
             task.pop("worker_pid", None)
             task["verification"] = verification
+            if verification["blocking_failure"]:
+                task["state"] = "blocked"
+                task["feedback"] = "Verification environment/timeout failure; no automatic worker retry. Inspect checks, fix the cause, then use ccl recover TASK --reverify --note 'evidence':\n" + dump(verification["checks"])
+                save_task(path, task)
+                return task
             if verification["passed"]:
                 task["state"] = "awaiting_review"
                 task["feedback"] = "Automated checks/artifact existence passed. Claude must inspect deliverables and accept."
@@ -431,10 +490,10 @@ def review(task_id, verdict, note):
     if not note.strip():
         raise ValueError("A concrete review note is required")
     path = task_path(task_id)
-    project = Path(read_json(path / "task.json")["project"])
+    project = Path(read_task(path / "task.json")["project"])
     with lock(project):
         assert_no_orphan(project)
-        task = read_json(path / "task.json")
+        task = read_task(path / "task.json")
         if task["state"] in TERMINAL:
             raise ValueError("Task already closed")
         if verdict == "accept":
@@ -467,9 +526,9 @@ def remember(task_id, text, evidence):
     if not text.strip() or len(text) > 2000 or not evidence.strip():
         raise ValueError("Memory requires <=2000 chars of confirmed knowledge and evidence")
     path = task_path(task_id)
-    project = Path(read_json(path / "task.json")["project"])
+    project = Path(read_task(path / "task.json")["project"])
     with lock(project):
-        task = read_json(path / "task.json")
+        task = read_task(path / "task.json")
         if task["state"] != "accepted":
             raise ValueError("Only accepted tasks may contribute confirmed memory")
         memory = initialize(project)
@@ -481,27 +540,47 @@ def remember(task_id, text, evidence):
         return {"memory": str(memory), "task": task_id}
 
 
-def tasks_for(project):
-    paths = sorted((bucket(project) / "tasks").glob("*/task.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-    return [read_json(p) for p in paths]
-
-
-def owned_tasks(session):
-    found = []
-    for p in (STATE / "projects").glob("*/tasks/*/task.json"):
-        task = read_json(p)
-        if task.get("owner_session") == session and task["state"] not in TERMINAL:
+def scan_tasks(project=None):
+    """Read records independently; never delete, rewrite or silently repair them."""
+    root = bucket(project) / "tasks" if project is not None else STATE / "projects"
+    paths = root.glob("*/task.json" if project is not None else "*/tasks/*/task.json")
+    found, issues = [], []
+    for path in paths:
+        try:
+            task = read_task(path)
             found.append(task)
-    return found
+        except (ValueError, OSError) as e:
+            issues.append({"path": str(path), "project_bucket": path.parents[2].name,
+                           "error": type(e).__name__ + ": " + str(e)})
+    return sorted(found, key=lambda t: t.get("updated_at", ""), reverse=True), issues
+
+
+def tasks_for(project):
+    tasks, issues = scan_tasks(project)
+    if issues:
+        raise ValueError("Damaged task record in this project; inspect ccl doctor before replay: " + issues[0]["path"])
+    return tasks
+
+
+def owned_tasks(session, project=None):
+    found, issues = scan_tasks()
+    # An unreadable unrelated project must not disable every session. The active
+    # project remains fail-closed: its unknown worker must not be duplicated.
+    saved = modes.ModeStore(STATE).get(session).get("project")
+    protected = {bucket(Path(p)).name for p in (project, saved) if p}
+    affected = [issue for issue in issues if issue["project_bucket"] in protected]
+    if affected:
+        raise ValueError("Damaged task record in this session's project; inspect ccl doctor: " + affected[0]["path"])
+    return [task for task in found if task.get("owner_session") == session and task["state"] not in TERMINAL]
 
 
 def adopt(task_id, session):
     modes.ModeStore(STATE).require(session, "1")
     path = task_path(task_id)
-    project = Path(read_json(path / "task.json")["project"])
+    project = Path(read_task(path / "task.json")["project"])
     with lock(project):
         assert_no_orphan(project)
-        task = read_json(path / "task.json")
+        task = read_task(path / "task.json")
         if task["state"] in TERMINAL:
             raise ValueError("Cannot adopt a closed task")
         task.setdefault("handoffs", []).append({"from": task.get("owner_session"), "to": session, "at": now()})
@@ -525,7 +604,92 @@ def native_memory(project, session, text, evidence):
 
 
 def summary(task):
-    return {k: task.get(k) for k in ["id", "project", "state", "attempts", "max_attempts", "thread_id", "feedback", "result", "verification"]} | {"records": str(task_path(task["id"]))}
+    path = task_path(task["id"])
+    return {k: task.get(k) for k in ["id", "project", "state", "attempts", "max_attempts", "thread_id", "feedback", "result", "verification"]} | {
+        "records": str(path), "progress": diagnostics.progress(task, path)}
+
+
+def candidate_available(task, path):
+    """Only the latest successfully completed worker output can be rechecked."""
+    try:
+        attempt = path / ("attempt-%02d" % task["attempts"])
+        result = read_json(attempt / "result.json")
+        validate_result(result)
+        events = parse_events(attempt / "events.jsonl")
+        return (result == task.get("result") and result["outcome"] == "ready" and not result["blockers"]
+                and events["completed"] and not events["failed"] and bool(task.get("history"))
+                and task["history"][-1].get("attempt") == task["attempts"]
+                and task["history"][-1].get("exit_code") == 0)
+    except (ValueError, OSError, KeyError, TypeError):
+        return False
+
+
+def recovery(task_id):
+    """Read-only advice; no mode edits, subprocess work, or automatic replay."""
+    path = task_path(task_id)
+    task = read_task(path / "task.json")
+    output = summary(task)
+    progress = output["progress"]
+    candidate = candidate_available(task, path)
+    if task["state"] in TERMINAL:
+        action, advice = "closed", "任务已关闭，不要重复执行。"
+    elif any(progress["processes"].values()):
+        action, advice = "inspect_live_process", "有记录进程仍存活；先核对对应进程及日志，不启动第二个执行者。"
+    elif task["state"] == "awaiting_review":
+        action, advice = "review_candidate", "先阅读实际产物与验收记录；合格后 review accept，无需重新调用 Codex。"
+    elif candidate:
+        action, advice = "inspect_then_reverify", "已有完整候选结果。先检查现场并解决环境问题，可显式 --reverify 重跑原验收，不消耗 Codex 次数，也不自动接受。"
+    elif task["attempts"] >= task["max_attempts"]:
+        action, advice = "revise_plan", "执行预算已耗尽；保留证据并调整计划，不自动新建同一任务。"
+    elif task["state"] == "planned":
+        action, advice = "run_planned", "尚未执行；确认原目标、授权与当前模式后运行原任务。"
+    else:
+        action, advice = "inspect_then_revise", "先检查已有日志、文件及外部副作用，再 review revise 写明恢复依据，继续原任务；不要重复派发。"
+    output["recovery"] = {"action": action, "advice": advice, "candidate_available": candidate,
+                          "read_only": True, "reverify_command": "ccl recover " + task_id + " --reverify --note '检查与恢复依据'" if candidate else None}
+    return output
+
+
+def reverify(task_id, note):
+    if not note.strip():
+        raise ValueError("Reverification requires a concrete inspection/recovery note")
+    path = task_path(task_id)
+    project = Path(read_task(path / "task.json")["project"])
+    with lock(project):
+        assert_no_orphan(project)
+        task = read_task(path / "task.json")
+        if task["state"] in TERMINAL:
+            raise ValueError("Task already closed")
+        if task.get("owner_session"):
+            modes.ModeStore(STATE).require(task["owner_session"], "1")
+        if not candidate_available(task, path):
+            raise ValueError("No completed current candidate to reverify; inspect then request revision")
+        attempt = path / ("recheck-" + uuid.uuid4().hex[:12])
+        attempt.mkdir()
+        task.update(state="verifying", runner_pid=os.getpid(), verification_records=str(attempt))
+        task.pop("verification", None)
+        save_task(path, task)
+        def record_worker(pid):
+            task["worker_pid"] = pid
+            save_task(path, task)
+        try:
+            verification = verify(task, attempt, record_worker)
+            task["verification"] = verification
+            task["state"] = ("awaiting_review" if verification["passed"] else "blocked" if verification["blocking_failure"]
+                             else "needs_revision" if task["attempts"] < task["max_attempts"] else "budget_exhausted")
+            task["feedback"] = "Reverification: " + note + "\n" + ("Checks passed; human review still required." if verification["passed"] else dump(verification["checks"]))
+        except (ValueError, OSError, subprocess.TimeoutExpired) as e:
+            task["state"], task["feedback"] = "blocked", "Reverification could not complete: " + str(e)
+        except (KeyboardInterrupt, SystemExit):
+            task["state"], task["feedback"] = "interrupted", "Reverification interrupted; inspect original candidate and check side effects."
+            raise
+        finally:
+            task.pop("runner_pid", None)
+            task.pop("worker_pid", None)
+            task.pop("recovery_required", None)
+            task.setdefault("rechecks", []).append({"at": now(), "note": note, "records": str(attempt), "state": task["state"]})
+            save_task(path, task)
+        return task
 
 
 def find_transcript(session):
@@ -542,13 +706,17 @@ def hook(payload):
     session = payload["session_id"]
     store = modes.ModeStore(STATE)
     event = payload.get("hook_event_name")
+    # Keep the read-only repair path usable even if task records are damaged.
+    if (event == "PreToolUse" and payload.get("tool_name") in ("Bash", "PowerShell") and
+            modes.diagnostic_command(payload.get("tool_input", {}).get("command", ""))):
+        return {}
     if payload.get("ccl_transport") == "module":
         # Store health metadata only, never prompts or tool arguments.
         with store.edit(session) as state:
             state["hook_transport"] = "module"
             state["hook_seen_at"] = modes.now()
             state.setdefault("hook_events", {})[event] = modes.now()
-    own = owned_tasks(session)
+    own = owned_tasks(session, project)
     tasks = [t for t in tasks_for(project) if t["state"] not in TERMINAL]
     if event == "SessionStart":
         store.hook_seen(session)
@@ -621,6 +789,13 @@ def main():
     status.add_argument("task", nargs="?")
     status.add_argument("--project", default=".")
     status.add_argument("--full", action="store_true")
+    doctor = sub.add_parser("doctor", help="Read-only local installation and hook diagnostics")
+    doctor.add_argument("--project", default=".")
+    doctor.add_argument("--session", default="", help="Inspect recorded hook evidence for this session")
+    recover = sub.add_parser("recover", help="Read-only recovery advice; --reverify explicitly reruns checks only")
+    recover.add_argument("task")
+    recover.add_argument("--reverify", action="store_true")
+    recover.add_argument("--note", default="")
     rev = sub.add_parser("review")
     rev.add_argument("task")
     rev.add_argument("verdict", choices=["accept", "revise", "cancel"])
@@ -648,7 +823,18 @@ def main():
     note.add_argument("--evidence", required=True)
     args = parser.parse_args()
     try:
-        if args.command == "mode":
+        if args.command == "doctor":
+            _, issues = scan_tasks()
+            output = diagnostics.doctor(VERSION, STATE, project_dir(args.project), issues, args.session)
+            print(dump(output))
+            return 0 if output["healthy"] else 2
+        elif args.command == "recover":
+            if args.reverify:
+                task = reverify(args.task, args.note)
+                print(dump(summary(task)))
+                return 0 if task["state"] == "awaiting_review" else 2
+            output = recovery(args.task)
+        elif args.command == "mode":
             store = modes.ModeStore(STATE)
             if args.action == "status":
                 output = store.get(args.session)
@@ -679,10 +865,15 @@ def main():
             return 0 if task["state"] == "awaiting_review" else 2
         elif args.command == "status":
             if args.task:
-                task = read_json(task_path(args.task) / "task.json")
-                output = task if args.full else summary(task)
+                task = read_task(task_path(args.task) / "task.json")
+                output = dict(task, progress=diagnostics.progress(task, task_path(task["id"]))) if args.full else summary(task)
             else:
-                output = [{"id": t["id"], "title": t["spec"]["title"], "state": t["state"], "attempts": t["attempts"]} for t in tasks_for(project_dir(args.project))[:20]]
+                tasks, issues = scan_tasks(project_dir(args.project))
+                listing = [{"id": t["id"], "title": t["spec"]["title"], "state": t["state"], "attempts": t["attempts"],
+                            "progress": diagnostics.progress(t, task_path(t["id"]))} for t in tasks[:20]]
+                output = {"tasks": listing, "record_issues": issues} if args.full else listing
+                if issues and not args.full:
+                    print(dump({"record_issues": issues, "advice": "Run ccl doctor; damaged records were not modified."}), file=sys.stderr)
         elif args.command == "review":
             output = summary(review(args.task, args.verdict, args.note))
         elif args.command == "remember":

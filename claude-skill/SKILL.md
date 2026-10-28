@@ -46,7 +46,11 @@ CCL_SPEC
 
 ## 闭环验收
 
-`@CCL@ status TASK_ID` 返回状态、简短结果、检查、sha256、工具调用数/usage所在的记录路径。详情按需读 `status TASK_ID --full` 或 records 下的文件，不把完整事件日志塞回对话。
+`@CCL@ status TASK_ID` 返回状态、简短结果、检查、sha256、progress（阶段、耗时、最后日志/状态活动、进程探测）及工具调用数/usage所在的记录路径。文件更新不是模型心跳，PID 存活不证明进程身份。详情按需读 `status TASK_ID --full` 或 records 下的文件，不把完整事件日志塞回对话。
+
+安装或 hooks 异常时先用 `@CCL@ doctor --project /absolute/project`；有真实 session id 时加 `--session SESSION_ID` 查看历史 hook 证据，不把配置成功等同于当前客户端已加载。`@CCL@ recover TASK_ID` 只读分析恢复步骤，不自动重跑任务。损坏记录保留原件；无关项目不受牵连，受影响项目须检查进程和备份后恢复，不能删除状态绕过预算。
+
+验收工具无法启动或超时会停止自动返修。解决原因且最新 worker 已完整交付后，可用 `@CCL@ recover TASK_ID --reverify --note '检查现场和恢复环境的依据'` 仅重跑原验收，不调用 Codex、不重置预算。此选项会执行 checks，不是只读；先确认检查的文件/外部副作用可重复。通过后仍须人工验收，不能直接称为完成。
 
 - `awaiting_review`：自动检查通过，仍待你验收。查看实际 diff/产物和检查日志，核对原始目标与授权。重要视觉产物需要实际渲染或打开查看；外部任务需要相应外部状态证据。程序会在接受时再次核对产物指纹和 Git 状态。
 - 合格：`@CCL@ review TASK_ID accept --note '实际看了哪些文件/结果，为什么满足哪些验收条件'`。有用经验写入记忆后，按 work-mode 的 mode finish 关闭本次任务状态、保留历史模式，再向用户报告结果并提示“下一项任务可选 1 或 2，不选就沿用本次模式”。

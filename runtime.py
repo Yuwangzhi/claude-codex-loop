@@ -2,11 +2,47 @@
 import contextlib
 import os
 from pathlib import Path
+import re
+import shlex
 import shutil
 import signal
 import subprocess
 import sys
 import time
+
+
+def hook_argv(command, binary, program):
+    """Recognize only standalone CCL launchers, including a former Python path.
+
+    This is a matcher, never a shell evaluator. Preserve unrelated commands and
+    compound commands rather than deleting hooks based on a substring.
+    """
+    if not isinstance(command, str):
+        return None
+    # Exact generated launchers also cover POSIX paths with quotes or literal $.
+    for launcher in (str(binary), str(binary) + '.cmd'):
+        if command in {launcher + ' hook', shlex.quote(launcher) + ' hook', '"' + launcher + '" hook'}:
+            return [launcher, 'hook']
+    if any(c in command for c in ('\n', '\r', '`', '$')):
+        return None
+    tokens = re.findall(r'''"[^"]*"|'[^']*'|[^\s"']+''', command)
+    if ' '.join(tokens).split() != command.split():
+        return None
+    parts = [s[1:-1] if s[:1] in ('"', "'") else s for s in tokens]
+
+    def same(left, right):
+        return os.path.normcase(os.path.normpath(left)) == os.path.normcase(os.path.normpath(str(right)))
+
+    if len(parts) == 2 and parts[1] == 'hook':
+        return parts if same(parts[0], binary) or same(parts[0], str(binary) + '.cmd') else None
+    if len(parts) != 5 or parts[1:3] != ['-X', 'utf8'] or parts[4] != 'hook':
+        return None
+    executable = parts[0].replace('\\', '/').rsplit('/', 1)[-1]
+    return parts if re.fullmatch(r'python(?:\d+(?:\.\d+)*)?(?:\.exe)?', executable, re.I) and same(parts[3], program) else None
+
+
+def managed_hook(command, binary, program):
+    return hook_argv(command, binary, program) is not None
 
 
 @contextlib.contextmanager
@@ -79,8 +115,8 @@ def executable_argv(argv):
         return [sys.executable, '-X', 'utf8'] + argv
     if os.name == 'nt':
         resolved = Path(shutil.which(argv[0]) or argv[0])
-        if argv[0].lower() == 'codex' and resolved.suffix.lower() not in ('.exe', '.cmd', '.bat'):
-            resolved = Path(shutil.which('codex.cmd') or resolved)
+        if argv[0].lower() in ('codex', 'claude') and resolved.suffix.lower() not in ('.exe', '.cmd', '.bat'):
+            resolved = Path(shutil.which(argv[0] + '.cmd') or resolved)
         if resolved.name.lower() in ('codex.cmd', 'codex.bat'):
             # Invoke the npm entry point without cmd.exe re-parsing JSON arguments.
             entry = resolved.parent / 'node_modules/@openai/codex/bin/codex.js'
@@ -88,6 +124,15 @@ def executable_argv(argv):
             if entry.is_file() and node:
                 return [node, str(entry)] + argv[1:]
             raise FileNotFoundError('Cannot resolve Codex npm entry point; set CCL_CODEX_BIN to codex.exe')
+        if resolved.name.lower() in ('claude.cmd', 'claude.bat'):
+            package = resolved.parent / 'node_modules/@anthropic-ai/claude-code'
+            native = package / 'bin/claude.exe'
+            if native.is_file():
+                return [str(native)] + argv[1:]
+            entry, node = package / 'cli.js', shutil.which('node')
+            if entry.is_file() and node:
+                return [node, str(entry)] + argv[1:]
+            raise FileNotFoundError('Cannot resolve Claude npm entry point; install a working native Claude CLI')
     return argv
 
 

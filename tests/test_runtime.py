@@ -1,16 +1,41 @@
 import os
 from pathlib import Path
+from pathlib import PurePosixPath
+import shlex
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 import ccl
 import runtime
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_generated_posix_quoted_launchers_are_recognized_exactly(self):
+        for directory in ("/home/O'Brien", '/home/name$literal', '/home/space name'):
+            binary = PurePosixPath(directory) / '.local/bin/ccl'
+            command = shlex.quote(str(binary)) + ' hook'
+            self.assertTrue(runtime.managed_hook(command, binary, PurePosixPath(directory) / 'ccl.py'))
+            self.assertFalse(runtime.managed_hook(command + '; echo keep', binary, PurePosixPath(directory) / 'ccl.py'))
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows npm shim resolution')
+    def test_claude_npm_shim_prefers_native_binary_then_js(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root / 'node_modules/@anthropic-ai/claude-code'
+            (package / 'bin').mkdir(parents=True)
+            native = package / 'bin/claude.exe'
+            native.touch()
+            lookup = {'claude': str(root / 'claude'), 'claude.cmd': str(root / 'claude.cmd'), 'node': 'node.exe'}
+            with patch.object(runtime.shutil, 'which', side_effect=lambda name: lookup.get(name)):
+                self.assertEqual(runtime.executable_argv(['claude', '--version']), [str(native), '--version'])
+                native.unlink()
+                (package / 'cli.js').touch()
+                self.assertEqual(runtime.executable_argv(['claude', '--version']), ['node.exe', str(package / 'cli.js'), '--version'])
+
     def test_pid_probe_never_terminates_process(self):
         process = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
         try:

@@ -8,6 +8,7 @@ from pathlib import Path
 import shlex
 import shutil
 import sys
+import runtime
 
 SOURCE = Path(__file__).resolve().parent
 HOME = Path.home()
@@ -25,14 +26,7 @@ def plugin_paths(settings):
 
 
 def managed_command(command):
-    if not isinstance(command, str):
-        return False
-    # Match only our exact installed launcher/interpreter, preserving other hooks.
-    candidates = {str(BIN) + " hook", shlex.quote(str(BIN)) + " hook",
-                  '"' + str(BIN) + '" hook',
-                  '"' + Path(sys.executable).as_posix() + '" -X utf8 "' +
-                  (PREFIX / 'ccl.py').as_posix() + '" hook'}
-    return command in candidates
+    return runtime.managed_hook(command, BIN, PREFIX / 'ccl.py')
 
 
 def configure_hooks(settings, transport):
@@ -113,7 +107,7 @@ def main(hook_transport=None):
     targets = [HOME / ".claude/CLAUDE.md", HOME / ".claude/settings.json", HOME / ".codex/AGENTS.md",
                HOME / ".claude/skills/codex-loop/SKILL.md", BIN, PREFIX / "ccl.py", PREFIX / "modes.py",
                HOME / ".claude/skills/work-mode/SKILL.md", HOME / ".config/claude-codex-loop/SHARED_MEMORY.md",
-               PREFIX / "runtime.py"]
+               PREFIX / "runtime.py", PREFIX / "diagnostics.py"]
     plugin_files = [".claude-plugin/plugin.json", "hooks/hooks.json", "hooks/hooks.mjs"]
     targets += [PREFIX / "desktop-plugin" / name for name in plugin_files + ["bridge.json"]]
     if os.name == 'nt':
@@ -129,12 +123,13 @@ def main(hook_transport=None):
     settings_path = HOME / ".claude/settings.json"
     settings = json.loads(settings_path.read_text(encoding="utf-8-sig")) if settings_path.exists() else {}
     if hook_transport is None:
-        hook_transport = "module" if str(PREFIX / "desktop-plugin") in plugin_paths(settings) else "command"
+        hook_transport = "module" if any(Path(p).expanduser() == PREFIX / "desktop-plugin" for p in plugin_paths(settings)) else "command"
     try:
         PREFIX.mkdir(parents=True, exist_ok=True)
         shutil.copy2(SOURCE / "ccl.py", PREFIX / "ccl.py")
         shutil.copy2(SOURCE / "modes.py", PREFIX / "modes.py")
         shutil.copy2(SOURCE / "runtime.py", PREFIX / "runtime.py")
+        shutil.copy2(SOURCE / "diagnostics.py", PREFIX / "diagnostics.py")
         if hook_transport == "module":
             for name in plugin_files:
                 destination = PREFIX / "desktop-plugin" / name

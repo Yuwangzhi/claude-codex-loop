@@ -28,6 +28,8 @@ UserPromptSubmit hook 识别 `1`、`2`、`一`、`二`、`模式1`、`模式二`
 
 用户已经选择但 hook 未记录，或桌面端没有传入模式状态时，先运行 `@CCL@ mode sync --session '${CLAUDE_SESSION_ID}'`。它从真实会话记录恢复选择，没有新选择时按规则沿用历史模式；不要用模型编写的文本替代真实输入。同步后按返回状态执行。只有确实没有可恢复的选择或历史模式时才询问，无法读取会话记录时报告具体错误。
 
+如果是安装/任务记录错误，而非缺少模式选择，用 `@CCL@ doctor --project /absolute/project --session '${CLAUDE_SESSION_ID}'` 只读诊断。它区分配置与历史加载证据，不自动改状态、清理记录或调用模型。`@CCL@ recover TASK_ID` 只读提供恢复建议；带 `--reverify` 则会执行原 checks，需先检查副作用，并受模式一和项目锁约束。
+
 ## 两条执行路径
 
 先确定真实项目，运行：
