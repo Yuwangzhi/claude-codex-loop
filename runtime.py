@@ -140,6 +140,30 @@ def process_options():
     return {'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == 'nt' else {'start_new_session': True}
 
 
+def capture_output(argv, timeout=8):
+    """Read-only CLI probe with process-tree cleanup, unlike subprocess.run timeout."""
+    p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         encoding='utf-8', errors='replace', **process_options())
+    try:
+        out, err = p.communicate(timeout=timeout)
+        return subprocess.CompletedProcess(argv, p.returncode, out, err)
+    except BaseException:
+        terminate_tree(p)
+        try:
+            p.communicate(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass  # Do not wait forever on a descendant's inherited pipe.
+        raise
+    finally:
+        for name, thread_name in (('stdout', 'stdout_thread'), ('stderr', 'stderr_thread')):
+            thread = getattr(p, thread_name, None)
+            # Closing a stream while Windows' reader owns its lock can block.
+            if thread is None or not thread.is_alive():
+                getattr(p, name).close()
+        if os.name == 'nt' and p.poll() is not None:
+            p._handle.Close()
+
+
 def terminate_tree(process):
     if os.name == 'nt':
         if process.poll() is None:

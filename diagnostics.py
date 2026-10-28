@@ -54,7 +54,7 @@ def progress(task, path):
             'process_identity_verified': False,
             'activity_note': '文件/状态最后更新，不是模型心跳；PID 存活不证明进程身份或任务仍在推进。',
             'failure_reason': task.get('feedback') if task.get('state') in
-            ('blocked', 'execution_failed', 'interrupted', 'budget_exhausted', 'needs_revision') else None}
+            ('blocked', 'execution_failed', 'interrupted', 'budget_exhausted', 'no_progress', 'needs_revision') else None}
 
 
 def read_json(path):
@@ -74,7 +74,7 @@ def doctor(version, state, project, record_issues, session='', home=None):
     for tool in ('git', 'codex', 'claude'):
         try:
             argv = runtime.executable_argv([os.environ.get('CCL_CODEX_BIN', tool) if tool == 'codex' else tool, '--version'])
-            result = subprocess.run(argv, capture_output=True, timeout=8, encoding='utf-8', errors='replace')
+            result = runtime.capture_output(argv, timeout=8)
             # Version commands only. Never dump configuration, auth files or stderr.
             line = result.stdout.strip().splitlines()
             check(tool, 'ok' if result.returncode == 0 else 'error',
@@ -89,6 +89,9 @@ def doctor(version, state, project, record_issues, session='', home=None):
               'running=' + version + ', installed=' + str(installed))
     except (OSError, ValueError, SyntaxError, StopIteration):
         check('installed_version', 'error', 'Installed runtime missing or version unreadable.')
+    missing = [name for name in ('modes.py', 'runtime.py', 'diagnostics.py', 'governance.py', 'compatibility.py', 'contextpack.py')
+               if not (prefix / name).is_file()]
+    check('runtime_modules', 'error' if missing else 'ok', ', '.join(missing) if missing else 'All runtime modules present.')
 
     env, hooks, disabled, commands = {}, {}, False, []
     settings_paths = list(dict.fromkeys([home / '.claude/settings.json', home / '.claude/settings.local.json',

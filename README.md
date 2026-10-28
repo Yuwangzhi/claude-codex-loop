@@ -51,7 +51,7 @@ flowchart TD
 | 环境 | 支持范围 |
 | --- | --- |
 | macOS | 完整 CCL 流程，已有真实 CLI 联调 |
-| Linux | POSIX 实现；提供自动测试与可选 CI 模板，尚未进行真实模型联调 |
+| Linux | POSIX 实现；配置了跨平台离线 CI，尚未进行真实模型联调 |
 | WSL | 可作为 Linux 环境使用，未单独进行端到端验证 |
 | Windows 原生 | **v0.3.0 起支持完整 CCL**：原生 Python、Windows 文件锁、进程树终止、UTF-8 状态及 `.cmd` / Git Bash 启动器，不需要 WSL |
 
@@ -193,6 +193,35 @@ ccl review TASK_ID accept --note '已阅读 report.json，内容与目标一致�
 
 Codex 的 `memory_proposals` 只是候选知识，由 Claude 验收后决定是否记录。不要放入 token、密码、完整日志或未经验证的猜测。本仓库忽略 `.ai-collab/`；其他项目如需保持记忆私有，也应加入其 `.gitignore`。
 
+## v0.4.0：明确交接、问题和累计预算
+
+保留原两种模式、同 thread 有限返修与最终验收，不引入新模型、daemon 或第三方 Python 依赖。
+
+| 能力 | 入口 | 边界 |
+| --- | --- | --- |
+| CLI 参数兼容检查 | `ccl doctor --compat` | 额外运行本机 help；不联网/开模型，不据此宣称登录、事件 schema 或工具可用 |
+| 任务契约 | spec SHA256 + 可选 `verification_files` | 检查前后/接受前核对，不允许改标准后复用旧证据 |
+| 结构化交接包 | `ccl handoff TASK` | 只读原目标、当前快照、检查/产物、问题、预算与上下文索引 |
+| 上下文装配 | `context_files/context_chars` + 可选 `.ai-collab/context.json` | 必需文件不截断；可选块按词项相关性选择，明确列出遗漏/过期 |
+| 问题台账 | `ccl finding TASK add/list/resolve` | 问题成立、驳回、延期、修复且复验分开；未解/过期项阻止 accept |
+| 累计预算 | `new --max-seconds N --max-tokens N` | CCL worker/check 执行时间；token 为调用间准入，不是中途截断或全账号账单 |
+| 无进展停止 | `no_progress` | 连续相同失败检查和产物哈希时停止自动返修 |
+
+完整字段、命令和旧任务兼容规则见 [契约、交接与预算](claude-skill/references/contracts.md)。旧任务历史时间显示 unknown，不伪造补算；旧候选须显式重验后绑定契约。
+
+```bash
+ccl doctor --compat
+ccl new --project /absolute/project --spec task.json --max-seconds 5400 --max-tokens 100000
+ccl run TASK
+ccl handoff TASK
+ccl finding TASK add --id F-001 --path src/export.py --problem '复现的问题' --evidence '实际失败证据'
+# 修复、检查通过并实际审查后：
+ccl finding TASK resolve --id F-001 --status fixed_verified --note '复验过程与结果'
+ccl review TASK accept --note '实际检查过的结果与验收依据'
+```
+
+`fixed_verified` 仍需 reviewer 的真实审查，通用测试通过不自动证明每个问题已修好。所有 budget/recovery/ledger 操作不自动新增模型调用、不清零既有预算。
+
 ## v0.3.2：诊断、状态与恢复
 
 ```bash
@@ -292,13 +321,16 @@ node --test tests/test_desktop_hooks.mjs
 
 自动测试不需要模型登录，不发出付费模型调用。覆盖返修、检查失败、产物变化、预算、锁与中断、共享记忆、模式隔离、安装保留设置和失败回退。v0.3.0 在 **macOS 与 Windows 各 38/38 通过**，新增跨进程锁、无副作用 PID 查询、超时子进程终止及 PowerShell 模式门控检查；真实模型联调与自动测试的证据边界见 [VALIDATION.md](VALIDATION.md)。
 
-可选 [GitHub Actions 模板](examples/github-actions.yml) 提供 macOS/Linux/Windows × Python 3.9/3.12 矩阵。要启用它，将文件复制到 `.github/workflows/tests.yml` 后提交；提交凭据需要允许写入 workflow。当前仓库没有启用云端 CI，不把本地测试当作云端测试结果。
+[GitHub Actions 工作流](.github/workflows/tests.yml) 配置 macOS/Linux/Windows × Python 3.9/3.12 矩阵，运行 Python/已安装 CLI 集成测试及 Node 22 hook 测试；[示例](examples/github-actions.yml) 与实际工作流一致。CI 不调用模型、不使用登录凭据，临时文件位于项目 tmp/。配置存在不等于云端运行通过，实际结果以 Actions run 为准。
 
 ```text
 ccl.py                任务执行、验证、审查、记忆与 hook 入口
 modes.py              session 模式状态与选择门控
 runtime.py            Windows/POSIX 锁、进程检查和启动兼容层
 diagnostics.py        只读安装诊断、进度与活动证据
+governance.py         契约、累计预算和用量完整性
+contextpack.py        上下文选择、新鲜度与遗漏清单
+compatibility.py      离线 CLI 参数契约探测
 install.py            备份、增量安装和失败回退
 desktop-plugin/       可选 Claude hooks module 到 Python 执行器的桥接
 claude-skill/         Claude 统筹 / Codex 执行规则
@@ -309,7 +341,7 @@ tests/                不调用真实模型的测试
 
 ## 参考与许可
 
-设计参考：[myclaude](https://github.com/stellarlinkco/myclaude)、[codex-handoff](https://github.com/tk-47/codex-handoff)、[claude-codex-handoff](https://github.com/OpenMOSS/claude-codex-handoff)。借鉴规划、持久交接和验收思路，未复制其实现。
+设计参考：[myclaude](https://github.com/stellarlinkco/myclaude)、[codex-handoff](https://github.com/tk-47/codex-handoff)、[claude-codex-handoff](https://github.com/OpenMOSS/claude-codex-handoff)。借鉴规划、持久交接和验收思路，未复制其实现。v0.4 另参考 [claudex-loop](https://github.com/chaseai-yt/claudex-loop) 的计划绑定、[skill-codex](https://github.com/Arystos/skill-codex) 的 CLI 契约、[ShareLane](https://github.com/Two19Labs/Sharelane-by-Two19-Labs) 的记忆新鲜度、[ignaval/skills](https://github.com/ignaval/skills) 的问题台账与 [mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent) 的预算边界；本项目按既有 Python 标准库架构独立实现。
 
 接口文档：[Codex 非交互模式](https://developers.openai.com/codex/noninteractive/)、[Claude skills](https://code.claude.com/docs/en/skills)、[Claude hooks](https://code.claude.com/docs/en/hooks)、[Claude permissions](https://code.claude.com/docs/en/permissions)、[GitHub CLI 凭据助手](https://cli.github.com/manual/gh_auth_setup-git)。
 

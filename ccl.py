@@ -12,12 +12,16 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 import modes
 import runtime
 import diagnostics
+import compatibility
+import contextpack
+import governance
 
-VERSION = "0.3.2"
+VERSION = "0.4.0"
 STATE = Path(os.environ.get("CCL_STATE_DIR", str(Path.home() / ".local/state/claude-codex-loop"))).expanduser()
 CONFIG = Path(os.environ.get("CCL_CONFIG_DIR", str(Path.home() / ".config/claude-codex-loop"))).expanduser()
 TERMINAL = {"accepted", "cancelled"}
@@ -83,13 +87,26 @@ def read_task(path):
             not all(isinstance(item, dict) for item in task.get("history", [])) or
             bucket(Path(task["project"])) != path.parents[2]):
         raise ValueError("Invalid task record structure or project identity: " + str(path))
+    validate_spec(task['spec'], Path(task['project']))
     if "result" in task:
         validate_result(task["result"])
     if "verification" in task:
         value = task["verification"]
         if (not isinstance(value, dict) or not isinstance(value.get("artifact_hashes"), dict) or
-                not isinstance(value.get("git"), dict) or not isinstance(value.get("checks"), list)):
+                type(value.get('passed')) is not bool or
+                not isinstance(value.get("git"), dict) or not isinstance(value.get("checks"), list) or
+                any(not isinstance(k, str) or not isinstance(v, str) or not re.fullmatch('[0-9a-f]{64}', v)
+                    for k, v in value['artifact_hashes'].items()) or
+                any(not isinstance(r, dict) or type(r.get('passed')) is not bool for r in value['checks'])):
             raise ValueError("Invalid verification record: " + str(path))
+        required = set(task['spec'].get('artifacts', []) + task.get('result', {}).get('artifacts', []))
+        if value['passed'] and (not required <= set(value['artifact_hashes']) or not all(r['passed'] for r in value['checks'])):
+            raise ValueError('Incomplete successful verification record: ' + str(path))
+        if not isinstance(value.get('finding_hashes', {}), dict) or any(
+                not isinstance(k, str) or (v is not None and (not isinstance(v, str) or not re.fullmatch('[0-9a-f]{64}', v)))
+                for k, v in value.get('finding_hashes', {}).items()):
+            raise ValueError('Invalid finding verification hashes')
+    governance.validate(task)
     return task
 
 
@@ -200,6 +217,16 @@ def validate_spec(spec, project):
         raise ValueError("Acceptance criteria and tangible artifact paths are required (a report counts)")
     for name in spec["artifacts"]:
         relative_file(project, name)
+    for key in ('context_files', 'verification_files', 'required_capabilities'):
+        value = spec.get(key, [])
+        if not isinstance(value, list) or not all(isinstance(x, str) and x.strip() for x in value):
+            raise ValueError(key + ' must be a string array')
+        if key != 'required_capabilities':
+            for name in value:
+                relative_file(project, name)
+    limit = spec.get('context_chars', 20000)
+    if type(limit) is not int or not 1000 <= limit <= 200000:
+        raise ValueError('context_chars must be 1000..200000')
     if not isinstance(spec.get("checks", []), list):
         raise ValueError("checks must be an array")
     for check in spec.get("checks", []):
@@ -213,21 +240,26 @@ def validate_spec(spec, project):
             raise ValueError("Check timeout must be 1..3600 seconds")
 
 
-def create(project, spec, owner="", attempts=3, sandbox="danger-full-access", timeout=1800):
+def create(project, spec, owner="", attempts=3, sandbox="danger-full-access", timeout=1800,
+           max_seconds=None, max_tokens=None):
     validate_spec(spec, project)
     if owner:
         modes.ModeStore(STATE).require(owner, "1")
     if not 1 <= attempts <= 5 or not 10 <= timeout <= 14400:
         raise ValueError("Attempts must be 1..5 and timeout 10..14400 seconds")
+    bound = governance.contract(spec, project)
+    total = max_seconds if max_seconds is not None else attempts * (timeout + sum(c.get('timeout', 300) for c in spec.get('checks', [])))
+    budget = governance.new_budget(min(total, 604800) if max_seconds is None else total, max_tokens)
     with lock(project):
         assert_no_orphan(project)
         initialize(project)
         task_id = uuid.uuid4().hex[:12]
         path = bucket(project) / "tasks" / task_id
-        task = {"id": task_id, "project": str(project), "spec": spec, "owner_session": owner,
+        task = {"record_version": 2, "id": task_id, "project": str(project), "spec": spec, "owner_session": owner,
                 "state": "planned", "attempts": 0, "max_attempts": attempts, "timeout": timeout,
                 "sandbox": sandbox, "thread_id": None, "created_at": now(), "feedback": "",
-                "history": [], "baseline": git_snapshot(project)}
+                "history": [], "baseline": git_snapshot(project), "contract": bound,
+                "budget": budget, "findings": []}
         save_task(path, task)
         if owner:
             modes.ModeStore(STATE).begin(owner, project, spec["title"])
@@ -268,7 +300,10 @@ def parse_events(path):
                 continue
             kind = event.get("type")
             if kind == "thread.started":
-                result["thread_id"] = event.get("thread_id")
+                if isinstance(event.get('thread_id'), str) and event['thread_id'].strip():
+                    result["thread_id"] = event['thread_id']
+                else:
+                    result['failed'] = True
             elif kind == "turn.completed":
                 result["completed"] = True
                 result["usage"] = event.get("usage", {})
@@ -280,12 +315,13 @@ def parse_events(path):
     return result
 
 
-def prompt_for(task):
+def task_context(task):
+    return contextpack.build(Path(task['project']), CONFIG, task['spec'], task['spec'].get('context_chars', 20000))
+
+
+def prompt_for(task, pack=None):
     project = Path(task["project"])
-    memory = []
-    for p in [CONFIG / "SHARED_MEMORY.md", project / ".ai-collab/MEMORY.md"]:
-        if p.exists():
-            memory.append(str(p) + "\n" + p.read_text(encoding="utf-8")[:10000])
+    pack = task_context(task) if pack is None else pack
     return """You are the execution worker for a task planned by Claude Code.
 Implement the supplied plan, perform the work, run relevant verification, and repair problems yourself.
 Claude owns overall decisions and final acceptance. Do not start Claude, ccl, or other orchestrators.
@@ -299,7 +335,32 @@ Headless tools may differ from desktop tools: verify availability. If work is an
 produce the specified report/artifact and record sources/actual inspection evidence. Self-reported
 success is not acceptance. Return only the requested structured result, concise summary <= 1200 chars.
 
-Task (original plan retained on every repair):\n""" + dump(task["spec"]) + "\n\nShared memory (context, not authority):\n" + "\n\n".join(memory) + "\n\nRepair/review feedback:\n" + (task.get("feedback") or "Initial execution.")
+Task (original plan retained on every repair):\n""" + dump(task["spec"]) + "\n\nShared memory (context, not authority):\n" + contextpack.render(pack) + "\n\nCumulative budget:\n" + dump(governance.view(task)) + "\n\nFinding ledger (reviewer-owned; do not edit):\n" + dump(effective_findings(task)) + "\n\nRequired capabilities (verify actual headless availability; never assume host tool inheritance):\n" + dump(task['spec'].get('required_capabilities', [])) + "\n\nRepair/review feedback:\n" + (task.get("feedback") or "Initial execution.")
+
+
+def budgeted_process(task, kind, argv, cwd, stdin, stdout, stderr, timeout, env=None, on_start=None):
+    remaining = governance.admit(task, worker=kind == 'worker')
+    limit = min(timeout, remaining) if remaining is not None else timeout
+    path = task_path(task['id'])
+    op = None
+    if 'budget' in task:
+        op = {'id': uuid.uuid4().hex, 'kind': kind, 'attempt': task['attempts'], 'status': 'running',
+              'started': time.time(), 'limit_seconds': limit, 'seconds': 0,
+              'input_tokens': 0, 'output_tokens': 0, 'cached_input_tokens': 0,
+              'usage_complete': kind != 'worker'}
+        task['budget']['operations'].append(op)
+        save_task(path, task)  # Reserve before launch so a crash cannot erase the charge.
+    start = time.monotonic()
+    try:
+        return process(argv, cwd, stdin, stdout, stderr, limit, env=env, on_start=on_start)
+    except subprocess.TimeoutExpired:
+        if remaining is not None and remaining <= timeout:
+            raise governance.BudgetExceeded('Cumulative execution deadline reached; process tree stopped')
+        raise
+    finally:
+        if op is not None:
+            governance.settle(op, stdout if kind == 'worker' else None, time.monotonic() - start)
+            save_task(path, task)
 
 
 def codex_argv(task, attempt):
@@ -324,6 +385,7 @@ def validate_result(result):
 
 
 def verify(task, attempt, on_start=None):
+    governance.check_contract(task)
     project = Path(task["project"])
     reports = []
     artifacts = {}
@@ -338,7 +400,7 @@ def verify(task, attempt, on_start=None):
         out, err = attempt / ("check-%d.out" % index), attempt / ("check-%d.err" % index)
         failure_kind = None
         try:
-            rc = process(check["argv"], project, None, out, err, check.get("timeout", 300), on_start=on_start)
+            rc = budgeted_process(task, 'check', check["argv"], project, None, out, err, check.get("timeout", 300), on_start=on_start)
             detail = out.read_text(encoding="utf-8", errors="replace")[-3000:] + err.read_text(encoding="utf-8", errors="replace")[-3000:]
         except subprocess.TimeoutExpired as e:
             rc, detail, failure_kind = -1, str(e), "timeout"
@@ -357,10 +419,14 @@ def verify(task, attempt, on_start=None):
             artifacts[name] = file_hash(p)
         else:
             reports.append({"name": "artifact " + name, "passed": False, "detail": "Removed during checks"})
+    governance.check_contract(task)
     result = {"passed": all(r["passed"] for r in reports), "checks": reports,
               "blocking_failure": any(r.get("failure_kind") in ("environment", "timeout") for r in reports),
               "artifact_hashes": artifacts, "git": git_snapshot(project),
-              "automated_check_count": len(task["spec"].get("checks", [])), "verified_at": now()}
+              "automated_check_count": len(task["spec"].get("checks", [])), "verified_at": now(),
+              "contract": task['contract'],
+              "finding_hashes": {f['path']: governance.file_digest(relative_file(project, f['path']))
+                                 for f in task.get('findings', [])}}
     atomic(attempt / "verification.json", dump(result))
     return result
 
@@ -374,6 +440,7 @@ def run_task(task_id):
     with lock(project):
         assert_no_orphan(project)
         task = read_task(path / "task.json")
+        governance.reconcile(task, path)
         if task.get("recovery_required"):
             raise ValueError("Inspect interrupted task evidence, then use review revise with recovery instructions")
         if task["state"] in ("running", "verifying"):
@@ -388,9 +455,27 @@ def run_task(task_id):
             return task
         if task["state"] in TERMINAL or task["state"] == "awaiting_review":
             raise ValueError("Task is " + task["state"] + "; review it or request a revision")
+        if task['state'] == 'no_progress':
+            raise ValueError('Inspect no_progress evidence, then review revise explicitly before another run')
         if task["attempts"] >= task["max_attempts"]:
             raise ValueError("Repair budget exhausted; Claude must revise the plan, not loop blindly")
         while task["attempts"] < task["max_attempts"]:
+            try:
+                governance.admit(task, worker=True)
+                if 'contract' not in task:
+                    task['contract'] = governance.contract(task['spec'], project)
+                    task['legacy_contract_bound'] = True
+                governance.check_contract(task)
+                pack = task_context(task)
+                dispatch = handoff_payload(task, pack)
+            except governance.BudgetExceeded as e:
+                task.update(state='budget_exhausted', feedback=str(e))
+                save_task(path, task)
+                return task
+            except (ValueError, OSError) as e:
+                task.update(state='blocked', feedback='Preflight failed: ' + str(e))
+                save_task(path, task)
+                return task
             if task.get("owner_session"):
                 try:
                     modes.ModeStore(STATE).require(task["owner_session"], "1")
@@ -407,20 +492,26 @@ def run_task(task_id):
             attempt = path / ("attempt-%02d" % task["attempts"])
             attempt.mkdir()
             atomic(attempt / "schema.json", dump(RESULT_SCHEMA))
-            prompt = prompt_for(task)
+            prompt = prompt_for(task, pack)
+            atomic(attempt / 'context.json', dump(pack))
+            atomic(attempt / 'handoff.json', dump(dict(dispatch, dispatch_attempt=task['attempts'])))
             atomic(attempt / "prompt.txt", prompt)
             task["state"] = "running"
             task["runner_pid"] = os.getpid()
             save_task(path, task)
             print(dump({"id": task_id, "state": "running", "attempt": task["attempts"]}), flush=True)
             interrupted = False
+            budget_failure = False
             def record_worker(pid):
                 task["worker_pid"] = pid
                 save_task(path, task)
             try:
                 env = dict(os.environ, CCL_WORKER="1")
-                rc = process(codex_argv(task, attempt), project, prompt, attempt / "events.jsonl",
+                rc = budgeted_process(task, 'worker', codex_argv(task, attempt), project, prompt, attempt / "events.jsonl",
                              attempt / "stderr.log", task["timeout"], env, record_worker)
+            except governance.BudgetExceeded as e:
+                rc, budget_failure = -1, True
+                task['feedback'] = str(e)
             except (subprocess.TimeoutExpired, OSError, KeyboardInterrupt, SystemExit) as e:
                 rc = -1
                 task["feedback"] = "Execution interrupted/failed: " + type(e).__name__ + ": " + str(e)
@@ -431,7 +522,11 @@ def run_task(task_id):
             task["history"].append({"attempt": task["attempts"], "exit_code": rc, **events})
             task.pop("runner_pid", None)
             task.pop("worker_pid", None)
-            if rc != 0 or not events["completed"] or events["failed"]:
+            if budget_failure:
+                task['state'] = 'budget_exhausted'
+                save_task(path, task)
+                return task
+            if rc != 0 or not events["completed"] or events["failed"] or not task.get('thread_id'):
                 task["state"] = "interrupted" if interrupted else "execution_failed"
                 task["feedback"] = task.get("feedback") if interrupted else "Codex process/turn failed. Inspect " + str(attempt / "stderr.log")
                 save_task(path, task)
@@ -460,6 +555,12 @@ def run_task(task_id):
                 task.pop("worker_pid", None)
                 save_task(path, task)
                 raise
+            except governance.BudgetExceeded as e:
+                task.update(state='budget_exhausted', feedback=str(e))
+                task.pop('worker_pid', None)
+                task.pop('runner_pid', None)
+                save_task(path, task)
+                return task
             except (ValueError, OSError, subprocess.TimeoutExpired) as e:
                 task["state"] = "blocked"
                 task["feedback"] = "Verification could not complete: " + str(e)
@@ -474,12 +575,24 @@ def run_task(task_id):
                 save_task(path, task)
                 return task
             if verification["passed"]:
+                task['failure_signatures'] = []
                 task["state"] = "awaiting_review"
                 task["feedback"] = "Automated checks/artifact existence passed. Claude must inspect deliverables and accept."
                 save_task(path, task)
                 return task
             task["state"] = "needs_revision"
             task["feedback"] = "Independent acceptance checks failed. Fix implementation without weakening checks:\n" + dump(verification["checks"])
+            signature = governance.digest({'artifacts': verification['artifact_hashes'],
+                'failures': [{k: r.get(k) for k in ('name', 'exit_code', 'detail')} for r in verification['checks'] if not r['passed']]})
+            previous = task.setdefault('failure_signatures', [])
+            same = (bool(previous) and previous[-1] == signature and
+                    task.get('last_failed_attempt') == task['attempts'] - 1)
+            previous.append(signature)
+            task['last_failed_attempt'] = task['attempts']
+            if same and task['attempts'] < task['max_attempts']:
+                task.update(state='no_progress', feedback='Identical failed checks and artifact hashes in consecutive attempts; inspect before requesting another bounded revision.')
+                save_task(path, task)
+                return task
             save_task(path, task)
         task["state"] = "budget_exhausted"
         save_task(path, task)
@@ -494,21 +607,18 @@ def review(task_id, verdict, note):
     with lock(project):
         assert_no_orphan(project)
         task = read_task(path / "task.json")
+        governance.reconcile(task, path)
         if task["state"] in TERMINAL:
             raise ValueError("Task already closed")
         if verdict == "accept":
-            if task["state"] != "awaiting_review" or not task.get("verification", {}).get("passed"):
-                raise ValueError("Only a verified candidate can be accepted")
-            for name, expected in task["verification"]["artifact_hashes"].items():
-                p = relative_file(project, name)
-                if not p.is_file() or file_hash(p) != expected:
-                    raise ValueError("Artifact changed since checks; request revision/reverification: " + name)
-            previous = task["verification"]["git"]
-            if previous != git_snapshot(project):
-                raise ValueError("Git workspace changed since checks; request revision/reverification")
+            verified_candidate(task)
+            pending = [f['id'] for f in effective_findings(task) if f['effective_status'] == 'accepted']
+            if pending:
+                raise ValueError('Unresolved or stale findings: ' + ', '.join(pending))
             task["state"] = "accepted"
             task["feedback"] = "Accepted after orchestrator review: " + note
         elif verdict == "revise":
+            governance.admit(task, worker=True)
             if task["attempts"] >= task["max_attempts"]:
                 raise ValueError("Budget exhausted; revise the plan and create a new task with prior evidence")
             task["state"] = "needs_revision"
@@ -520,6 +630,126 @@ def review(task_id, verdict, note):
         task.setdefault("reviews", []).append({"verdict": verdict, "note": note, "at": now()})
         save_task(path, task)
         return task
+
+
+def verified_candidate(task):
+    governance.check_contract(task)
+    if task['state'] != 'awaiting_review' or not task.get('verification', {}).get('passed'):
+        raise ValueError('Only a verified candidate can be accepted')
+    if task['verification'].get('contract') != task['contract']:
+        raise ValueError('Verification contract missing or changed; explicitly reverify')
+    folder = task_path(task['id'])
+    receipt_dir = Path(task.get('verification_records') or folder / ('attempt-%02d' % task['attempts']))
+    if receipt_dir.parent != folder or read_json(receipt_dir / 'verification.json') != task['verification']:
+        raise ValueError('Verification receipt does not match task record; inspect/reverify')
+    project = Path(task['project'])
+    for name, expected in task['verification']['artifact_hashes'].items():
+        p = relative_file(project, name)
+        if not p.is_file() or file_hash(p) != expected:
+            raise ValueError('Artifact changed since checks; request revision/reverification: ' + name)
+    if task['verification']['git'] != git_snapshot(project):
+        raise ValueError('Git workspace changed since checks; request revision/reverification')
+
+
+def finding_snapshot(task, name):
+    project = Path(task['project'])
+    git = git_snapshot(project)
+    return {'path_sha256': governance.file_digest(relative_file(project, name)),
+            'git_fingerprint': git.get('fingerprint'), 'spec_sha256': governance.digest(task['spec'])}
+
+
+def effective_findings(task):
+    output = []
+    for finding in task.get('findings', []):
+        stale = finding['snapshot'] != finding_snapshot(task, finding['path'])
+        if finding['status'] == 'fixed_verified':
+            stale = stale or finding.get('verification_sha256') != governance.digest(task.get('verification'))
+        output.append(dict(finding, stale=stale,
+                           effective_status='accepted' if stale else finding['status']))
+    return output
+
+
+def finding_update(task_id, action, finding_id, path='', severity='medium', problem='', evidence='', status='', note=''):
+    folder = task_path(task_id)
+    project = Path(read_task(folder / 'task.json')['project'])
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,63}', finding_id):
+        raise ValueError('Finding id must be 1..64 letters, numbers, dot, underscore or hyphen')
+    with lock(project):
+        assert_no_orphan(project)
+        task = read_task(folder / 'task.json')
+        if 'contract' not in task:
+            raise ValueError('Legacy task must run or explicitly reverify before using the finding ledger')
+        if task['state'] in TERMINAL or task['state'] in ('running', 'verifying'):
+            raise ValueError('Cannot change findings on a closed or interrupted active task; inspect/recover first')
+        ledger = task.setdefault('findings', [])
+        item = next((f for f in ledger if f['id'] == finding_id), None)
+        if action == 'add':
+            if not all(isinstance(x, str) and x.strip() for x in (path, problem, evidence)):
+                raise ValueError('Finding requires path, problem and concrete evidence')
+            if severity not in ('high', 'medium', 'low'):
+                raise ValueError('Invalid severity')
+            fields = dict(id=finding_id, path=path, severity=severity, problem=problem, evidence=evidence)
+            if item:
+                if any(item[k] != v for k, v in fields.items()):
+                    raise ValueError('Finding id already identifies a different issue')
+                return item  # Repeated delivery is idempotent, never silently reopen.
+            item = dict(fields, status='accepted', snapshot=finding_snapshot(task, path), history=[])
+            ledger.append(item)
+        elif action == 'resolve':
+            if not item or not note.strip():
+                raise ValueError('Existing finding and concrete disposition note required')
+            if status not in ('accepted', 'rejected', 'deferred', 'fixed_verified'):
+                raise ValueError('Invalid finding status')
+            if status == 'fixed_verified':
+                verified_candidate(task)
+                receipt = task['verification']
+                hashes = dict(receipt.get('finding_hashes', {}), **receipt['artifact_hashes'])
+                if item['path'] not in hashes or hashes[item['path']] != governance.file_digest(relative_file(project, item['path'])):
+                    raise ValueError('Finding path was not verified at its current contents; explicitly reverify')
+                item['verification_sha256'] = governance.digest(task['verification'])
+            else:
+                item.pop('verification_sha256', None)
+            item.update(status=status, snapshot=finding_snapshot(task, item['path']))
+        else:
+            raise ValueError('Invalid finding action')
+        item['history'].append({'at': now(), 'status': item['status'], 'note': note or evidence,
+                                'snapshot': item['snapshot']})
+        save_task(folder, task)
+        return item
+
+
+def handoff_payload(task, pack=None):
+    project = Path(task['project'])
+    current = git_snapshot(project)
+    verification = task.get('verification')
+    artifact_state = {name: governance.file_digest(relative_file(project, name))
+                      for name in (verification or {}).get('artifact_hashes', {})}
+    finding_state = {name: governance.file_digest(relative_file(project, name))
+                     for name in (verification or {}).get('finding_hashes', {})}
+    try:
+        governance.check_contract(task)
+        contract_current = True
+    except (ValueError, OSError):
+        contract_current = False
+    if pack is None:
+        try:
+            pack = task_context(task)
+        except (ValueError, OSError) as e:
+            pack = {'selected': [], 'omitted': [], 'error': str(e),
+                    'warnings': ['Context assembly failed; no worker should be started until resolved.']}
+    return {'format_version': 1, 'task_id': task['id'], 'owner_session': task.get('owner_session'),
+            'thread_id': task.get('thread_id'), 'state': task['state'], 'spec': task['spec'],
+            'contract': task.get('contract'), 'baseline': task.get('baseline'), 'current_git': current,
+            'verification': verification, 'result': task.get('result'), 'feedback': task.get('feedback'),
+            'evidence_current': bool(contract_current and verification and verification.get('git') == current and
+                                     verification.get('artifact_hashes') == artifact_state and
+                                     verification.get('finding_hashes', {}) == finding_state and
+                                     verification.get('contract') == task.get('contract')),
+            'findings': effective_findings(task), 'budget': governance.view(task),
+            'context': contextpack.manifest(pack),
+            'required_capabilities': [{'name': x, 'status': 'unknown'} for x in task['spec'].get('required_capabilities', [])],
+            'records': str(task_path(task['id'])), 'read_only': True,
+            'next_action': 'Inspect evidence and unresolved findings; do not infer acceptance from worker summary.'}
 
 
 def remember(task_id, text, evidence):
@@ -606,7 +836,9 @@ def native_memory(project, session, text, evidence):
 def summary(task):
     path = task_path(task["id"])
     return {k: task.get(k) for k in ["id", "project", "state", "attempts", "max_attempts", "thread_id", "feedback", "result", "verification"]} | {
-        "records": str(path), "progress": diagnostics.progress(task, path)}
+        "records": str(path), "progress": diagnostics.progress(task, path),
+        "budget": governance.view(task), "contract": task.get('contract'),
+        "findings": effective_findings(task)}
 
 
 def candidate_available(task, path):
@@ -631,12 +863,23 @@ def recovery(task_id):
     output = summary(task)
     progress = output["progress"]
     candidate = candidate_available(task, path)
+    budget_reason = None
+    if not any(progress['processes'].values()):
+        projected = read_json(path / 'task.json')
+        governance.reconcile(projected, path)  # In-memory projection only; no writes.
+        output['budget'] = governance.view(projected)
+        try:
+            governance.admit(projected, worker=not candidate)
+        except governance.BudgetExceeded as e:
+            budget_reason = str(e)
     if task["state"] in TERMINAL:
         action, advice = "closed", "任务已关闭，不要重复执行。"
     elif any(progress["processes"].values()):
         action, advice = "inspect_live_process", "有记录进程仍存活；先核对对应进程及日志，不启动第二个执行者。"
     elif task["state"] == "awaiting_review":
         action, advice = "review_candidate", "先阅读实际产物与验收记录；合格后 review accept，无需重新调用 Codex。"
+    elif budget_reason:
+        action, advice = 'revise_plan', '预算阻止继续执行：' + budget_reason + '。保留证据，不通过恢复重置预算。'
     elif candidate:
         action, advice = "inspect_then_reverify", "已有完整候选结果。先检查现场并解决环境问题，可显式 --reverify 重跑原验收，不消耗 Codex 次数，也不自动接受。"
     elif task["attempts"] >= task["max_attempts"]:
@@ -646,7 +889,7 @@ def recovery(task_id):
     else:
         action, advice = "inspect_then_revise", "先检查已有日志、文件及外部副作用，再 review revise 写明恢复依据，继续原任务；不要重复派发。"
     output["recovery"] = {"action": action, "advice": advice, "candidate_available": candidate,
-                          "read_only": True, "reverify_command": "ccl recover " + task_id + " --reverify --note '检查与恢复依据'" if candidate else None}
+                          "read_only": True, "reverify_command": "ccl recover " + task_id + " --reverify --note '检查与恢复依据'" if candidate and action == 'inspect_then_reverify' else None}
     return output
 
 
@@ -664,6 +907,12 @@ def reverify(task_id, note):
             modes.ModeStore(STATE).require(task["owner_session"], "1")
         if not candidate_available(task, path):
             raise ValueError("No completed current candidate to reverify; inspect then request revision")
+        governance.reconcile(task, path)
+        governance.admit(task)
+        if 'contract' not in task:
+            task['contract'] = governance.contract(task['spec'], project)
+            task['legacy_contract_bound'] = True
+        governance.check_contract(task)
         attempt = path / ("recheck-" + uuid.uuid4().hex[:12])
         attempt.mkdir()
         task.update(state="verifying", runner_pid=os.getpid(), verification_records=str(attempt))
@@ -675,9 +924,13 @@ def reverify(task_id, note):
         try:
             verification = verify(task, attempt, record_worker)
             task["verification"] = verification
+            if verification['passed']:
+                task['failure_signatures'] = []
             task["state"] = ("awaiting_review" if verification["passed"] else "blocked" if verification["blocking_failure"]
                              else "needs_revision" if task["attempts"] < task["max_attempts"] else "budget_exhausted")
             task["feedback"] = "Reverification: " + note + "\n" + ("Checks passed; human review still required." if verification["passed"] else dump(verification["checks"]))
+        except governance.BudgetExceeded as e:
+            task['state'], task['feedback'] = 'budget_exhausted', str(e)
         except (ValueError, OSError, subprocess.TimeoutExpired) as e:
             task["state"], task["feedback"] = "blocked", "Reverification could not complete: " + str(e)
         except (KeyboardInterrupt, SystemExit):
@@ -782,6 +1035,8 @@ def main():
     new.add_argument("--owner-session", default="")
     new.add_argument("--max-attempts", type=int, default=3)
     new.add_argument("--timeout", type=int, default=1800)
+    new.add_argument('--max-seconds', type=int, help='Cumulative CCL worker/check execution seconds; excludes human wait')
+    new.add_argument('--max-tokens', type=int, help='Observed input + output token admission budget; unknown prior usage blocks next worker')
     new.add_argument("--sandbox", choices=["danger-full-access", "workspace-write", "read-only"], default="danger-full-access")
     run = sub.add_parser("run")
     run.add_argument("task")
@@ -792,6 +1047,19 @@ def main():
     doctor = sub.add_parser("doctor", help="Read-only local installation and hook diagnostics")
     doctor.add_argument("--project", default=".")
     doctor.add_argument("--session", default="", help="Inspect recorded hook evidence for this session")
+    doctor.add_argument('--compat', action='store_true', help='Offline Codex exec/resume --help compatibility probe')
+    handoff = sub.add_parser('handoff', help='Read-only versioned review/context manifest')
+    handoff.add_argument('task')
+    finding = sub.add_parser('finding', help='Reviewer-owned issue ledger; never auto-accepts the task')
+    finding.add_argument('task')
+    finding.add_argument('action', choices=['list', 'add', 'resolve'])
+    finding.add_argument('--id', default='')
+    finding.add_argument('--path', default='')
+    finding.add_argument('--severity', choices=['low', 'medium', 'high'], default='medium')
+    finding.add_argument('--problem', default='')
+    finding.add_argument('--evidence', default='')
+    finding.add_argument('--status', choices=['accepted', 'rejected', 'deferred', 'fixed_verified'], default='')
+    finding.add_argument('--note', default='')
     recover = sub.add_parser("recover", help="Read-only recovery advice; --reverify explicitly reruns checks only")
     recover.add_argument("task")
     recover.add_argument("--reverify", action="store_true")
@@ -826,8 +1094,19 @@ def main():
         if args.command == "doctor":
             _, issues = scan_tasks()
             output = diagnostics.doctor(VERSION, STATE, project_dir(args.project), issues, args.session)
+            if args.compat:
+                output['compatibility'] = compatibility.probe()
+                output['healthy'] = output['healthy'] and output['compatibility']['status'] == 'ok'
             print(dump(output))
             return 0 if output["healthy"] else 2
+        elif args.command == 'handoff':
+            output = handoff_payload(read_task(task_path(args.task) / 'task.json'))
+        elif args.command == 'finding':
+            if args.action == 'list':
+                output = effective_findings(read_task(task_path(args.task) / 'task.json'))
+            else:
+                output = finding_update(args.task, args.action, args.id, args.path, args.severity,
+                                        args.problem, args.evidence, args.status, args.note)
         elif args.command == "recover":
             if args.reverify:
                 task = reverify(args.task, args.note)
@@ -857,7 +1136,8 @@ def main():
             output = native_memory(project_dir(args.project), args.session, args.text, args.evidence)
         elif args.command == "new":
             spec = json.load(sys.stdin) if args.spec == "-" else read_json(Path(args.spec))
-            task = create(project_dir(args.project), spec, args.owner_session, args.max_attempts, args.sandbox, args.timeout)
+            task = create(project_dir(args.project), spec, args.owner_session, args.max_attempts, args.sandbox, args.timeout,
+                          args.max_seconds, args.max_tokens)
             output = {"id": task["id"], "state": task["state"], "records": str(task_path(task["id"]))}
         elif args.command == "run":
             task = run_task(args.task)
@@ -880,8 +1160,11 @@ def main():
             output = remember(args.task, args.text, args.evidence)
         elif args.command == "context":
             project = project_dir(args.project)
-            output = {"project": str(project), "memory": {str(p): p.read_text(encoding="utf-8")[:12000] for p in
-                     [CONFIG / "SHARED_MEMORY.md", project / ".ai-collab/MEMORY.md"] if p.exists()},
+            pack = contextpack.build(project, CONFIG)
+            memory = {}
+            for item in pack['selected']:
+                memory[item['path']] = memory.get(item['path'], '') + item['content']
+            output = {"project": str(project), "memory": memory, 'context_manifest': contextpack.manifest(pack),
                      "pending": [{"id": t["id"], "state": t["state"]} for t in tasks_for(project) if t["state"] not in TERMINAL][:10]}
         else:
             payload = json.load(sys.stdin)

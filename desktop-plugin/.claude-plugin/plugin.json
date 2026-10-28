@@ -1,6 +1,6 @@
 {
   "name": "ccl-work-modes",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "description": "CCL execution mode hooks for Claude Code Desktop and CLI.",
   "author": {
     "name": "Yuwangzhi"

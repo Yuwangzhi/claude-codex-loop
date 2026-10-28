@@ -1,0 +1,39 @@
+name: Offline tests
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ['3.9', '3.12']
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Python and installed CLI integration tests
+        run: |
+          mkdir -p tmp/ci
+          scratch="$PWD/tmp/ci"
+          if command -v cygpath >/dev/null; then scratch="$(cygpath -m "$scratch")"; fi
+          export TMPDIR="$scratch" TMP="$scratch" TEMP="$scratch" PYTHONDONTWRITEBYTECODE=1
+          python -X utf8 -B -m unittest discover -s tests -v
+      - name: Node desktop hook bridge
+        run: |
+          mkdir -p tmp/ci
+          scratch="$PWD/tmp/ci"
+          if command -v cygpath >/dev/null; then scratch="$(cygpath -m "$scratch")"; fi
+          export TMPDIR="$scratch" TMP="$scratch" TEMP="$scratch"
+          node --test tests/test_desktop_hooks.mjs

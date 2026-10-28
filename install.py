@@ -16,6 +16,7 @@ PREFIX = HOME / ".local/share/claude-codex-loop"
 BIN = HOME / ".local/bin/ccl"
 MARKER = "claude-codex-loop"
 EVENTS = ["SessionStart", "UserPromptSubmit", "PreToolUse", "Stop", "PostToolUse"]
+MODULES = ['ccl.py', 'modes.py', 'runtime.py', 'diagnostics.py', 'governance.py', 'compatibility.py', 'contextpack.py']
 
 
 def plugin_paths(settings):
@@ -108,6 +109,9 @@ def main(hook_transport=None):
                HOME / ".claude/skills/codex-loop/SKILL.md", BIN, PREFIX / "ccl.py", PREFIX / "modes.py",
                HOME / ".claude/skills/work-mode/SKILL.md", HOME / ".config/claude-codex-loop/SHARED_MEMORY.md",
                PREFIX / "runtime.py", PREFIX / "diagnostics.py"]
+    targets += [PREFIX / name for name in MODULES if PREFIX / name not in targets]
+    reference = HOME / '.claude/skills/codex-loop/references/contracts.md'
+    targets.append(reference)
     plugin_files = [".claude-plugin/plugin.json", "hooks/hooks.json", "hooks/hooks.mjs"]
     targets += [PREFIX / "desktop-plugin" / name for name in plugin_files + ["bridge.json"]]
     if os.name == 'nt':
@@ -126,10 +130,8 @@ def main(hook_transport=None):
         hook_transport = "module" if any(Path(p).expanduser() == PREFIX / "desktop-plugin" for p in plugin_paths(settings)) else "command"
     try:
         PREFIX.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(SOURCE / "ccl.py", PREFIX / "ccl.py")
-        shutil.copy2(SOURCE / "modes.py", PREFIX / "modes.py")
-        shutil.copy2(SOURCE / "runtime.py", PREFIX / "runtime.py")
-        shutil.copy2(SOURCE / "diagnostics.py", PREFIX / "diagnostics.py")
+        for name in MODULES:
+            shutil.copy2(SOURCE / name, PREFIX / name)
         if hook_transport == "module":
             for name in plugin_files:
                 destination = PREFIX / "desktop-plugin" / name
@@ -149,6 +151,8 @@ def main(hook_transport=None):
         skill = HOME / ".claude/skills/codex-loop/SKILL.md"
         skill.parent.mkdir(parents=True, exist_ok=True)
         skill.write_text((SOURCE / "claude-skill/SKILL.md").read_text(encoding="utf-8").replace("@CCL@", skill_command), encoding="utf-8")
+        reference.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(SOURCE / 'claude-skill/references/contracts.md', reference)
         entry = HOME / ".claude/skills/work-mode/SKILL.md"
         entry.parent.mkdir(parents=True, exist_ok=True)
         entry.write_text((SOURCE / "mode-skill/SKILL.md").read_text(encoding="utf-8").replace("@CCL@", skill_command), encoding="utf-8")

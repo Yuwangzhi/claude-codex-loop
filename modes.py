@@ -143,8 +143,15 @@ def diagnostic_command(command):
         return False
     if parts[1] == 'doctor':
         rest = parts[2:]
-        return len(rest) % 2 == 0 and all(rest[i] in ('--project', '--session') for i in range(0, len(rest), 2))
-    return len(parts) == 3 and parts[1] == 'recover' and bool(re.fullmatch(r'[0-9a-f]{12}', parts[2]))
+        while rest:
+            if rest[0] == '--compat':
+                rest = rest[1:]
+            elif rest[0] in ('--project', '--session') and len(rest) >= 2 and not rest[1].startswith('--'):
+                rest = rest[2:]
+            else:
+                return False
+        return True
+    return len(parts) == 3 and parts[1] in ('recover', 'handoff') and bool(re.fullmatch(r'[0-9a-f]{12}', parts[2]))
 
 
 def dispatches_codex(tool, args):

@@ -205,7 +205,7 @@ class DoctorTests(unittest.TestCase):
         self.program = '"C:/Old Python/python.exe" -X utf8 "' + (self.prefix / 'ccl.py').as_posix() + '" hook'
         self.settings.write_text(json.dumps({'hooks': {event: [{'hooks': [{'command': self.program}]}]
             for event in ('SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse', 'Stop')}}))
-        self.probe = patch.object(diagnostics.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, 'fixture-version\n', ''))
+        self.probe = patch.object(diagnostics.runtime, 'capture_output', return_value=subprocess.CompletedProcess([], 0, 'fixture-version\n', ''))
         self.probe.start()
         self.addCleanup(self.probe.stop)
 
@@ -238,7 +238,7 @@ class DoctorTests(unittest.TestCase):
 
     def test_version_probe_failure_and_bad_settings_are_reported(self):
         self.settings.write_text('[]')
-        with patch.object(diagnostics.subprocess, 'run', side_effect=FileNotFoundError('not installed')):
+        with patch.object(diagnostics.runtime, 'capture_output', side_effect=FileNotFoundError('not installed')):
             report = self.doctor()
         names = {c['name'] for c in report['checks'] if c['status'] == 'error'}
         self.assertTrue({'git', 'codex', 'claude', 'settings'} <= names)

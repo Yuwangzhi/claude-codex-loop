@@ -54,7 +54,7 @@ class InstallTests(unittest.TestCase):
         self.assertEqual((self.prefix / 'ccl.py').read_bytes(), (install.SOURCE / 'ccl.py').read_bytes())
         command = ['cmd', '/d', '/c', str(self.bin.with_suffix('.cmd')), '--version'] if os.name == 'nt' else [str(self.bin), '--version']
         result = subprocess.run(command, capture_output=True, text=True, check=True)
-        self.assertEqual(result.stdout.strip(), '0.3.2')
+        self.assertEqual(result.stdout.strip(), '0.4.0')
         self.assertNotIn('@CCL@', (folder / 'skills/codex-loop/SKILL.md').read_text())
         self.assertNotIn(b'\r\n', self.bin.read_bytes())
 
@@ -143,6 +143,9 @@ class InstallTests(unittest.TestCase):
         self.assertFalse((self.prefix / 'modes.py').exists())
         self.assertFalse((self.prefix / 'runtime.py').exists())
         self.assertFalse((self.prefix / 'diagnostics.py').exists())
+        for name in ('governance.py', 'compatibility.py', 'contextpack.py'):
+            self.assertFalse((self.prefix / name).exists())
+        self.assertFalse((self.home / '.claude/skills/codex-loop/references/contracts.md').exists())
         self.assertFalse(self.bin.exists())
         manifests = list((self.home / '.local/state/claude-codex-loop/backups').glob('*/manifest.json'))
         self.assertEqual(len(manifests), 1)
@@ -170,6 +173,12 @@ class InstallTests(unittest.TestCase):
         self.assertEqual((self.prefix / 'diagnostics.py').read_bytes(), (install.SOURCE / 'diagnostics.py').read_bytes())
         manifests = list((self.home / '.local/state/claude-codex-loop/backups').glob('*/manifest.json'))
         self.assertIn(str(self.prefix / 'diagnostics.py'), {item['path'] for item in json.loads(manifests[0].read_text())})
+        for name in install.MODULES:
+            self.assertEqual((self.prefix / name).read_bytes(), (install.SOURCE / name).read_bytes())
+            self.assertIn(str(self.prefix / name), {item['path'] for item in json.loads(manifests[0].read_text())})
+        reference = self.home / '.claude/skills/codex-loop/references/contracts.md'
+        self.assertEqual(reference.read_bytes(), (install.SOURCE / 'claude-skill/references/contracts.md').read_bytes())
+        self.assertIn(str(reference), {item['path'] for item in json.loads(manifests[0].read_text())})
 
     def test_forward_slash_module_path_is_preserved_on_reinstall(self):
         with contextlib.redirect_stdout(io.StringIO()):

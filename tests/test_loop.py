@@ -51,6 +51,8 @@ class LoopTests(unittest.TestCase):
         self.root = Path(self.tmp.name).resolve()
         self.project = self.root / 'project with spaces'
         self.project.mkdir()
+        # Tests under repository tmp/ must not inherit the parent's Git snapshot.
+        subprocess.run(['git', 'init', '-q', str(self.project)], check=True)
         self.fake = self.root / 'fake-codex.py'
         self.fake.write_text(FAKE)
         self.fake.chmod(0o700)

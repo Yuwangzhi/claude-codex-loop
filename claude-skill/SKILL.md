@@ -10,6 +10,8 @@ description: 当前执行方式为模式一时，由 Claude Code 规划、调度
 当前 Claude session id：`${CLAUDE_SESSION_ID}`。
 CLI：`@CCL@`。它继承现有 Codex 登录和模型，不需要新 API key。
 
+需要定义上下文/验收文件、设置累计预算、处理具体审查问题或旧任务恢复时，读 [契约、交接与预算](references/contracts.md)。v0.4 支持 `doctor --compat`、只读 `handoff TASK`、reviewer-owned `finding` 台账和 `new --max-seconds/--max-tokens`；不增加额外模型调用。
+
 Windows：以下 heredoc 示例用 Git Bash/Bash 工具执行；如果只使用 PowerShell，请调用同目录的 `ccl.cmd`，用 PowerShell here-string 或 UTF-8 JSON 文件传任务。不要把 Bash heredoc 原样放进 PowerShell。CCL 支持原生 Windows，无需转入 WSL。
 
 用户已要求自动执行：新任务默认 `approval_policy=never` + `sandbox_mode=danger-full-access`，首轮和返修相同。统一使用 ccl new/run，不另开交互式 Codex 终端，不加 `on-request`、`--full-auto` 或默认 `workspace-write` 覆盖该设置。用户明确要求只读/限制目录时才传 `--sandbox read-only|workspace-write`。任务内不逐命令要求 Yes/No。登录失效、操作系统授权、浏览器工具自己的确认要求仍需准确报告。旧任务记录和已运行的交互终端保留原权限，不在运行中更改或重复派发。
@@ -42,7 +44,7 @@ CCL_SPEC
 
 示例里的占位目标和路径必须换成真实内容。对于代码任务加入项目适用的测试/构建 `checks`，例如 `{"name":"单元测试","argv":["python3","-m","unittest","discover","-s","tests"],"timeout":300}`。分析/视觉任务可以 `checks: []`，但要有报告/图片/PDF 等真实产物，由你实际阅读/渲染验收，不能把“文件存在”当成质量合格。
 
-默认单项目串行、每个任务最多 3 次 Codex 执行（包含你要求的返修），每次最长 30 分钟。程序自动把失败的验收结果交回同一 Codex thread；身份验证、进程错误、工具缺失不会无限重试。不要调用 `resume --last`，不要同时操作同一项目。长任务用 Bash 的 `run_in_background` 和完成通知/TaskOutput 等待，等待期间不频繁向模型查询空状态。
+默认单项目串行、每个任务最多 3 次 Codex 执行（包含你要求的返修），每次最长 30 分钟，并受累计执行时间约束。程序把失败的验收结果交回同一 Codex thread；相同失败和产物连续出现时停在 no_progress。身份验证、进程错误、工具缺失不会无限重试。不要调用 `resume --last`，不要同时操作同一项目。长任务用 Bash 的 `run_in_background` 和完成通知/TaskOutput 等待，等待期间不频繁向模型查询空状态。
 
 ## 闭环验收
 
@@ -55,7 +57,7 @@ CCL_SPEC
 - `awaiting_review`：自动检查通过，仍待你验收。查看实际 diff/产物和检查日志，核对原始目标与授权。重要视觉产物需要实际渲染或打开查看；外部任务需要相应外部状态证据。程序会在接受时再次核对产物指纹和 Git 状态。
 - 合格：`@CCL@ review TASK_ID accept --note '实际看了哪些文件/结果，为什么满足哪些验收条件'`。有用经验写入记忆后，按 work-mode 的 mode finish 关闭本次任务状态、保留历史模式，再向用户报告结果并提示“下一项任务可选 1 或 2，不选就沿用本次模式”。
 - 有具体问题：`@CCL@ review TASK_ID revise --note '问题位置、证据和修复要求'`，再 `@CCL@ run TASK_ID`。无需让用户再次批准已授权的修复。
-- `blocked/execution_failed/interrupted/budget_exhausted`：看证据并判断能否解决。预算耗尽后先改变计划，确有必要才新建任务并引用旧记录，不能通过新建任务绕过停机条件。用户决定或权限缺失时明确说明具体阻碍。不能把未验收称为已完成。
+- `blocked/execution_failed/interrupted/budget_exhausted/no_progress`：看证据并判断能否解决。预算耗尽后先改变计划，确有必要才新建任务并引用旧记录，不能通过新建任务绕过停机条件。用户决定或权限缺失时明确说明具体阻碍。不能把未验收称为已完成。
 - 用户取消：`@CCL@ review TASK_ID cancel --note '用户取消/变更目标'`。运行中先终止并等待对应 Bash 后台任务退出；不要盲杀全部 Codex 进程。
 
 ## 共享记忆

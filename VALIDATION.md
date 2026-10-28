@@ -2,6 +2,19 @@
 
 公开版保留验证范围和结论；个人路径、认证信息、私有仓库、任务 ID、会话日志及访问修复记录留在维护者本地，不随仓库发布。
 
+## v0.4.0：契约、交接、台账与预算（2026-10-28）
+
+- 最终 Windows 原生 Python 3.12.0 与 3.12.7：各 **125/125 离线测试通过**，Node 桥接 **8/8 通过**；包括真实 subprocess 与隔离安装后的 CLI 新建→执行→finding→拒绝过早接受→复验登记→accept 全链路，不是真实模型评测。两个 skill 结构校验和 git diff --check 通过。
+- 新增覆盖 spec/验收文件变化、必要上下文超限、可选记忆遗漏与 stale、只读 handoff、稳定 finding ID、未解问题阻断、修复证据失效、累计时间与 token、未知用量、硬中断结算和相同失败停止。
+- 兼容性探测只检查当前本机 help 参数，不声称通过联网上游 schema 或真实模型能力验证。默认 doctor 不联网、不开模型。
+- 旧任务保持原有 attempts/thread；旧时间不可追溯，显示 legacy/unknown。旧候选必须显式重验绑定契约，不静默改写历史。
+- 已添加六组合跨平台 CI 和 Node 测试。云端运行结果以对应 GitHub Actions run 为准，不能把本地 Windows 结果当成其他平台实测。
+- 三个独立提交前审计按执行/预算、上下文/验收、安装/交付分工；发现项已修复并逆向复核。包括 stale 别名绕过、必需上下文被相关性过滤、未跟踪/ignored finding 文件证据绑定、损坏契约/receipt coverage、legacy 降级、无进展续跑与失败序列、不可执行恢复建议、Windows probe 子进程超时。
+- 实际本机备份更新为 v0.4.0，保留原 Python 3.12.7 与 module 通路；doctor --compat 返回 healthy=true、exec/resume 参数均兼容。当前桌面 hook 加载、认证和事件 schema 未被此探测证明，仍准确标 unknown。
+- 安装后的 7 个运行模块、3 个 hook/module 文件、2 个 skills 与 1 个 reference 共 **13 项与源码一致**；6 个配置文件及6个既有任务/会话 JSON 的内容哈希不变。
+- 实际用户安装入口在独立 state/config/project 中完成模拟 worker smoke：handoff 只读；未解决 finding、已改变的验收脚本分别拒绝 accept；恢复原验收内容、实际读取产物与检查结果后 accepted；关闭任务拒绝 reverify。只有 1 次模拟 worker 调用，记录 15 个模拟 token，不是真实账号用量。
+- 本轮未启动真实 Claude/Codex 模型或重启用户桌面会话；备份路径与隔离验证日志仅留本机。
+
 ## v0.3.2：稳定性修复与可诊断恢复（2026-10-28）
 
 - Windows 原生 Python 3.12.0：**88/88 Python 自动测试通过**；Node 桌面桥接测试 **8/8 通过**。两个 skill 的结构校验及 `git diff --check` 通过。本次不据此宣称 macOS/Linux 或云端 CI 已验证。
