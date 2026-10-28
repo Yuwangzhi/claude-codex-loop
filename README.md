@@ -4,7 +4,9 @@
 
 **只和 Claude 对话，让 Claude 定方案、Codex 干活，最后由 Claude 验收。也可以选择全部由 Claude 完成。**
 
-![Claude–Codex Loop：Claude 统筹，Codex 执行，共享项目上下文](docs/claude-codex-loop-promo-20261024.png)
+![Claude–Codex Loop v0.4.0：Claude 规划、Codex 执行、CCL 独立检查、Claude 验收；以任务契约、交接包、问题台账和累计预算支持有界返修，也可仅使用 Claude](docs/claude-codex-loop-overview-v0.4.png)
+
+概览图展示主要分工；具体分支见下方[模式选择](#两种模式)与[执行闭环](#闭环是怎样实现的)。[图片说明与生成提示词](docs/visual-assets.md)。
 
 A local, two-mode workflow for Claude Code and Codex CLI: plan → execute → verify → repair → review → shared memory. Python standard library only; uses your existing CLI authentication.
 
@@ -21,23 +23,26 @@ A local, two-mode workflow for Claude Code and Codex CLI: plan → execute → v
 
 ```mermaid
 flowchart TD
-    U[提出任务] --> S{本次选择或历史模式}
-    S -->|无历史且未选择| Q[询问模式 等待回答]
+    U["提出新任务"] --> S{"本次明确选择<br/>否则沿用历史模式"}
+    S -->|无选择且无历史| Q["询问模式，等待回答"]
     Q --> S
-    S -->|1| P[Claude 规划与定义验收]
-    P --> E[Codex 执行与自测]
-    E --> V{独立检查通过?}
-    V -->|否 且仍有预算| E
-    V -->|是| R{Claude 验收}
-    R -->|需返修 且仍有预算| E
-    R -->|通过| M[记录已验证共享知识]
-    V -->|阻塞或预算耗尽| B[保留现场并报告原因]
-    R -->|预算耗尽| B
-    S -->|2| C[Claude 执行并验证]
-    C --> M
-    M --> D[交付结果 关闭任务并保留模式]
-    D --> N[下一项可选 1 或 2 不选则沿用]
+    S -->|模式一| M1["Claude 规划，Codex 执行<br/>独立检查后由 Claude 验收"]
+    S -->|模式二| M2["Claude 规划、执行与验证<br/>不调用 Codex"]
+    M1 -->|验收通过| D["按需记录已验证知识<br/>交付结果，保留模式"]
+    M2 -->|验证完成| D
+    D --> N["等待下一项任务<br/>可选 1 或 2，不选则沿用"]
+
+    classDef neutral fill:#f5f7fa,stroke:#8293a6,color:#102a43;
+    classDef claude fill:#fff1e6,stroke:#d68a51,color:#102a43;
+    classDef loop fill:#e5f5f2,stroke:#438d87,color:#102a43;
+    classDef done fill:#eaf4e8,stroke:#6a9463,color:#102a43;
+    class U,S,Q,N neutral;
+    class M1 loop;
+    class M2 claude;
+    class D done;
 ```
+
+模式一的返修、阻塞与停止分支见[执行闭环](#闭环是怎样实现的)。模式二不经过 CCL 的 Codex 任务执行器；两种模式都不会仅因时间流逝而自动开始下一项任务。
 
 ## 快速开始
 
@@ -151,14 +156,53 @@ Claude 调用 Bash 是**另一层权限**。希望 Claude 也不逐条询问时�
 
 ## 闭环是怎样实现的？
 
-1. **Claude 写任务**：目标、计划、约束、交付物、验收条件和真实检查命令。
-2. **CCL 调用 Codex**：保留 JSONL 事件、结构化结果和明确的 thread ID。
-3. **独立检查**：运行事先定义的检查，核对文件存在，记录 SHA256 与 Git 状态。
-4. **自动返修**：失败证据交回同一个 Codex thread。默认总共最多 3 次执行，每次最长 30 分钟。
-5. **Claude 验收**：`awaiting_review` 只是候选结果；阅读 diff、报告或渲染结果后才能接受。接受前再次比较产物和 Git 指纹。
-6. **记录知识并交付**：验收后的事实进入共享记忆，再结束本次模式。
+1. **定义并绑定任务**：Claude 写明目标、计划、约束、交付物、验收条件和检查命令；CCL 绑定 spec SHA256，以及可选的 `verification_files` 内容。
+2. **准备交接并执行**：调用前核对契约、装配上下文、检查剩余预算；保存上下文与交接快照，再启动 Codex，保留 JSONL 事件、结构化结果和 thread ID。
+3. **独立检查并留证**：CCL 运行原任务定义的 checks，核对产物，记录文件 SHA256、Git 状态和检查回执；检查前后都核对契约。这里是独立执行检查命令，不是另开一个审查模型。
+4. **有界返修或停止**：普通检查失败可将证据交回同一个 Codex thread；默认总共最多 3 次执行，单次 worker 最长 30 分钟，并受累计预算约束。触发 `no_progress`、预算耗尽或环境/执行异常时停止自动返修。
+5. **Claude 审查并接受**：`awaiting_review` 只是候选。通过 `ccl handoff TASK` 阅读证据、实际检查 diff/产物并处理问题台账；accept 前再次核对契约、回执、产物和 Git 指纹，未解决或过期 finding 会阻止接受。
+6. **按需记忆并交付**：验收后由统筹方选择已验证知识写入共享记忆，再结束本次任务、保留模式偏好；候选知识不会自动成为已确认事实。
 
-身份验证、进程错误和明确阻塞不会无限重试。记录可用于恢复，但本项目不会后台唤醒 Claude 自动验收。
+```mermaid
+flowchart TD
+    P["Claude 定义目标与验收<br/>CCL 绑定任务契约"] --> G{"调用前检查<br/>契约、上下文、预算"}
+    G -->|通过| E["Codex 执行与自测<br/>返修沿用同一 thread"]
+    G -->|不通过| S["停止自动执行<br/>保留现场，报告原因"]
+    E -->|完整候选| V["CCL 独立检查<br/>契约 + checks + 文件证据"]
+    E -->|错误、中断或阻塞| S
+    V -->|检查通过| H["候选 awaiting_review<br/>读取 handoff 与证据"]
+    V -->|普通检查失败| F{"仍有次数和预算<br/>且未触发 no_progress？"}
+    V -->|工具、超时、契约或预算异常| S
+    F -->|是：有界返修| G
+    F -->|否| S
+    H --> R{"Claude 实际审查<br/>且 accept 复核通过？"}
+    R -->|是| D["接受并交付<br/>按需记录已验证知识"]
+    R -->|否：先处理问题或证据| S
+
+    classDef claude fill:#fff1e6,stroke:#d68a51,color:#102a43;
+    classDef worker fill:#d5efeb,stroke:#438d87,color:#102a43;
+    classDef evidence fill:#edf4fa,stroke:#6a8aa4,color:#102a43;
+    classDef stop fill:#fff0ed,stroke:#bd7464,color:#7d3426;
+    classDef done fill:#eaf4e8,stroke:#6a9463,color:#102a43;
+    class P,R claude;
+    class E worker;
+    class G,V,H,F evidence;
+    class S stop;
+    class D done;
+```
+
+上图展示 `run → review` 主路径。**停止自动推进不等于关闭任务**；统筹方核查原因后，按下表显式处置，不会自动走恢复分支。
+
+| 现场情况 | 显式处置 | 回到哪里 |
+| --- | --- | --- |
+| 仅问题台账待处理 | 审查证据，按实际情况 `finding resolve`；不能把待处理项直接当成已修复 | 重新审查并 `review accept`；不必启动 worker |
+| 实现需要修改，或触发 `no_progress` | 查明原因，`review revise --note '具体证据'` 后 `run`；仍须有次数与预算 | 调用前检查，再用同一 thread 执行 |
+| 验收工具已恢复，或当前完整候选需要重验 | 满足状态、锁、契约和剩余检查时间等条件后，`recover --reverify --note '核查依据'` | 只运行原 checks；通过回到 `awaiting_review`，未通过继续停下，**不自动调用 Codex** |
+| 契约改变、预算耗尽，或暂时无法安全继续 | 保留证据并报告；确需新方案时重新审定，不清空原任务记录来绕过上限 | 不自动恢复 |
+
+`no_progress` 只检测连续相同失败检查与产物哈希；显式返修和重验都不重置预算。token 限额在下一次 worker 调用前检查，不是调用内实时截断。accept 会核对契约、检查回执、产物与 Git 指纹，以及是否仍有未解决/过期 finding；明确驳回或延期的问题不冒充已修复。
+
+身份验证、进程错误和明确阻塞不会自动重试。`ccl doctor --compat` 可在安装或 CLI 更新后手动做兼容检查，不在每轮执行中自动运行，也不证明登录或工具能力。记录可用于恢复，但本项目不会后台唤醒 Claude 自动验收。
 
 ### 手动体验执行器
 
