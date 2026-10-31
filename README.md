@@ -19,24 +19,27 @@ A local, two-mode workflow for Claude Code and Codex CLI: plan → execute → v
 | **1：Claude 统筹 + Codex 执行** | 理解需求、形成计划、定义验收标准、检查结果 | 修改代码/文档、分析、运行测试、按反馈返修 |
 | **2：仅 Claude** | 独立完成规划、执行、验证和交付 | 不调用 |
 
-每项新任务都说明当前模式，可回复 `1`、`2`、`一`、`二`、`模式1`、`模式二`，也接受“二吧”“就用1”等表达。未指定时沿用当前 session 的上次模式；新 session 则采用用户最近一次明确选择的偏好。从无历史选择时才询问并等待。同一任务内的补充、检查和返修继续当前模式，其他窗口的选择不会切换正在执行的任务。
+**用户指定了就照办，没指定就由 Claude 按任务难度自己选，不会反问。** 可回复 `1`、`2`、`一`、`二`、`模式1`、`模式二`、`mode 2`、`moshi 2`，也接受“二吧”“就用1”“用模式二做”等表达。未指定时：问答、调研、小改动、配置部署等几步内能做完的任务选模式二；多文件、长耗时、批量、需要独立验收的任务选模式一（直接 `ccl new` 即记为模式一）。Claude 会在开头用一句话说明所选模式，回复 `1`/`2` 可随时改。同一任务内的补充、检查和返修继续当前模式；新任务难度明显不同时，Claude 自选的模式可以重选，用户明确选过的不会被改。其他窗口的选择不会切换正在执行的任务。
 
 ```mermaid
 flowchart TD
-    U["提出新任务"] --> S{"本次明确选择<br/>否则沿用历史模式"}
-    S -->|无选择且无历史| Q["询问模式，等待回答"]
-    Q --> S
-    S -->|模式一| M1["Claude 规划，Codex 执行<br/>独立检查后由 Claude 验收"]
-    S -->|模式二| M2["Claude 规划、执行与验证<br/>不调用 Codex"]
+    U["提出新任务"] --> S{"用户明确指定？"}
+    S -->|否| Q["Claude 按任务难度自选<br/>一句话告知，不询问"]
+    Q --> S2{"选定模式"}
+    S -->|是| S2
+    S2 -->|模式一| M1
+    S2 -->|模式二| M2
+    M1["Claude 规划，Codex 执行<br/>独立检查后由 Claude 验收"]
+    M2["Claude 规划、执行与验证<br/>不调用 Codex"]
     M1 -->|验收通过| D["按需记录已验证知识<br/>交付结果，保留模式"]
     M2 -->|验证完成| D
-    D --> N["等待下一项任务<br/>可选 1 或 2，不选则沿用"]
+    D --> N["等待下一项任务<br/>不指定则重新按难度选"]
 
     classDef neutral fill:#f5f7fa,stroke:#8293a6,color:#102a43;
     classDef claude fill:#fff1e6,stroke:#d68a51,color:#102a43;
     classDef loop fill:#e5f5f2,stroke:#438d87,color:#102a43;
     classDef done fill:#eaf4e8,stroke:#6a9463,color:#102a43;
-    class U,S,Q,N neutral;
+    class U,S,S2,Q,N neutral;
     class M1 loop;
     class M2 claude;
     class D done;
@@ -109,13 +112,14 @@ python -X utf8 install.py
 ### 3. 和 Claude 对话
 
 ```text
-你：帮我修复项目中的 CSV 导入错误。
-Claude：还没有历史选择，本次用模式一（Claude 统筹、Codex 执行），还是模式二（全部由 Claude 完成）？
-你：1
-Claude：制定计划 → 交给 Codex → 检查结果 → 必要时返修 → 交付。
-Claude：下一项任务可选 1 或 2，不选就沿用本次模式。
+你：帮我修复项目中的 CSV 导入错误，涉及几个模块并要补测试。
+Claude：本次按难度选模式一（多文件 + 需独立验收），回复 2 可改为仅 Claude。制定计划 → 交给 Codex → 检查结果 → 必要时返修 → 交付。
 你：继续修复导出功能。
-Claude：本次沿用模式一；回复 2 可切到仅 Claude。随后继续执行。
+Claude：同一任务，沿用模式一。
+你：顺便把 README 里的版本号改一下。
+Claude：这是单文件小改动，改用模式二自己做。
+你：模式一：把整个目录的测试补全。
+Claude：按你的指定用模式一。
 ```
 
 也可以把模式与任务一起提交：
@@ -126,9 +130,9 @@ Claude：本次沿用模式一；回复 2 可切到仅 Claude。随后继续执�
 /codex-loop 为这个目录生成一份结构说明。
 ```
 
-`/codex-loop` 是显式选择模式一的快捷入口；`/work-mode` 加载模式管理规则。普通任务中的数字、“看一下”等词，以及同时提到两个模式但没有作出选择的句子，不会被硬猜成某个模式。未指定模式的任务按历史偏好继续；从无历史时等待选择。默认沿用会明确显示在回复中，不等同于用户本次显式选择。
+`/codex-loop` 是显式选择模式一的快捷入口；`/work-mode` 加载模式管理规则。普通任务中的数字、“看一下”等词，以及同时提到两个模式但没有作出选择的句子，不会被硬猜成某个模式。未指定模式的任务由 Claude 自选，并在回复中明确说明；自选不等同于用户的显式选择，用户随后回复 `1`/`2` 即以用户为准。
 
-空白页面是否显示启动提示取决于客户端；hooks 不会凭空生成一条模型消息。若桌面端 hook 没有记录已经提交的选择，可运行 `ccl mode sync --session SESSION_ID`，从真实会话记录恢复选择或历史默认值。无需让模型伪造输入，也不用反复回答同一个菜单。没有新任务输入时不会后台自动开始工作。
+空白页面是否显示启动提示取决于客户端；hooks 不会凭空生成一条模型消息。若桌面端 hook 没有记录已经提交的选择，可运行 `ccl mode sync --session SESSION_ID`，从真实会话记录恢复。未选择模式时 hook 不会拦截任何工具调用，也不再要求在回复末尾附选择菜单或强制调用 `mode finish`（回合结束时自动保持当前模式）。无需让模型伪造输入。没有新任务输入时不会后台自动开始工作。
 
 ## 权限：为什么不会逐条要求 Yes / No？
 
@@ -232,10 +236,24 @@ ccl review TASK_ID accept --note '已阅读 report.json，内容与目标一致�
 | 通用协作规则 | `~/.config/claude-codex-loop/SHARED_MEMORY.md` | 安装器维护标记区块，保留其他内容 |
 | 可选本机访问说明 | `~/.config/claude-codex-loop/ACCESS_HANDOFF.md` | 用户自行提供；不存在时跳过 |
 | 当前模式与任务状态 | `~/.local/state/claude-codex-loop/sessions/` | 按 session 隔离，保留该 session 的上次模式 |
-| 默认模式偏好 | `~/.local/state/claude-codex-loop/mode-preference.json` | 保存用户最近明确选择，供没有历史的新 session 使用；不写入项目事实记忆 |
+| 默认模式偏好 | `~/.local/state/claude-codex-loop/mode-preference.json` | 保存用户最近明确选择，仅作参考提示；不再决定新任务的模式，也不写入项目事实记忆 |
 | 执行与审查记录 | `~/.local/state/claude-codex-loop/projects/` | 保存任务、尝试、检查和审查记录 |
 
 Codex 的 `memory_proposals` 只是候选知识，由 Claude 验收后决定是否记录。不要放入 token、密码、完整日志或未经验证的猜测。本仓库忽略 `.ai-collab/`；其他项目如需保持记忆私有，也应加入其 `.gitignore`。
+
+## 0.4.0 之后的改动：自动选模式与更少的失败
+
+| 问题 | 现在 |
+| --- | --- |
+| 新 session 没有模式记录时，门禁拒绝几乎所有工具，连 `ccl mode sync \| head` 这类带管道的恢复命令也被拒 | 未选模式不再拦截；Claude 用 `ccl mode begin --mode 1\|2` 自选，直接 `ccl new` 视为选模式一。只有用户**明确**选了模式二时才拒绝派发 Codex |
+| 只认中文“模式二”，`moshi 2`、`mode 2` 不识别 | 识别拼音与英文写法；疑问句、否定句、普通数字仍不算选择 |
+| Stop hook 每轮强制菜单提示和 `mode finish` | 不再强制；回合结束自动把任务置为 ready，后续补充沿用模式 |
+| Claude 自选后用户回复 `1`/`2` 无法覆盖 | 自选模式接受用户随后的单独 `1`/`2`，以用户为准 |
+| 验收脚本有语法错时白烧一次 Codex（任务 blocked 且无法 `--reverify`） | `ccl new` 对 `verification_files` 与 `checks` 里的 `.py` 预编译，不过就拒绝创建 |
+| heredoc 内联 spec 的 Windows 路径触发 `Invalid \escape` | 报错附带正确做法：用文件传 `--spec`，路径用 `/`；`claude-skill/references/spec-template.json` 提供固定模板 |
+| Windows 上 Codex 进程偶发以 `0xC0000142` 退出且无任何事件 | 自动重试启动（最多 2 次），不占 attempt，仍计入累计预算 |
+
+`codex-loop` skill 新增失败速查表（现象 → 原因 → 处理）。Mac 与 Windows 用同一份源码部署；两个 skill 里的 `@CCL@` 由部署时替换成本机 ccl 路径。
 
 ## v0.4.0：明确交接、问题和累计预算
 
@@ -299,7 +317,7 @@ ccl recover TASK_ID --reverify --note '已检查上次产物、日志及外部�
 | --- | --- |
 | 查看现有任务 | `ccl context --project PATH`、`ccl status TASK_ID` |
 | 要求返修 | `ccl review TASK_ID revise --note '具体问题和证据'`，随后 `ccl run TASK_ID` |
-| 新 session 接续旧任务 | 确认模式一（本次选择或历史默认），核对现场，再 `ccl adopt TASK_ID --session SESSION_ID` |
+| 新 session 接续旧任务 | 确认当前为模式一，核对现场，再 `ccl adopt TASK_ID --session SESSION_ID` |
 | 切到模式二 | 停止并等待旧 worker 退出、保留成果、关闭旧任务，再激活待切换模式 |
 | 硬中断 | 核对进程、文件和外部状态，再按原记录恢复，避免重复副作用 |
 | 预算耗尽 | 报告证据并调整计划，不断新建相同任务不能绕过上限 |
