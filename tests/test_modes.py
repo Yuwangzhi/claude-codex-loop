@@ -29,14 +29,50 @@ class ModeTests(unittest.TestCase):
     def hook(self, event, **kwargs):
         return ccl.hook(dict(cwd=str(self.project),session_id=self.session,hook_event_name=event,**kwargs))
 
-    def test_no_default_and_unselected_cannot_execute(self):
+    def test_unselected_is_never_blocked_and_claude_is_told_to_choose(self):
         self.hook('SessionStart')
-        self.hook('UserPromptSubmit',prompt='帮我修改文件')
+        response = self.hook('UserPromptSubmit', prompt='帮我修改文件')
         self.assertIsNone(self.store.get(self.session)['mode'])
-        for tool in ['Read','Write','Bash','Agent','mcp__browser__run']:
-            response=self.hook('PreToolUse',tool_name=tool,tool_input={'command':'touch test'})
-            self.assertEqual(response['hookSpecificOutput']['permissionDecision'],'deny')
-        self.assertEqual(self.hook('PreToolUse',tool_name='Skill',tool_input={'skill':'work-mode'}),{})
+        context = response['hookSpecificOutput']['additionalContext']
+        self.assertIn('不要问用户', context)
+        self.assertIn('--mode', context)
+        for tool in ['Read', 'Write', 'Bash', 'Agent', 'mcp__browser__run']:
+            self.assertEqual(self.hook('PreToolUse', tool_name=tool, tool_input={'command': 'touch test'}), {})
+        self.assertEqual(self.hook('PreToolUse', tool_name='Bash', tool_input={'command': 'ccl mode sync --session x | head'}), {})
+
+    def test_claude_picks_by_difficulty_and_user_choice_wins(self):
+        self.hook('UserPromptSubmit', prompt='帮我改一个小文件')
+        state = self.store.begin(self.session, self.project, 'small edit', '2')
+        self.assertEqual((state['mode'], state['selection_source']), ('2', 'auto_by_claude'))
+        # Claude may re-pick for a harder task while no Codex task is open ...
+        self.assertEqual(self.store.begin(self.session, self.project, 'big', '1')['mode'], '1')
+        # ... but not while one is open, and never against an explicit user choice.
+        self.assertEqual(self.store.begin(self.session, self.project, 'x', '2', [{'id': 'open'}])['mode'], '1')
+        self.hook('UserPromptSubmit', prompt='moshi 2')
+        self.assertEqual(self.store.get(self.session)['selection_source'], 'explicit_user_prompt')
+        self.assertEqual(self.store.begin(self.session, self.project, 'y', '1')['mode'], '2')
+
+    def test_dispatch_without_a_mode_selects_mode_one_unless_user_chose_two(self):
+        self.assertEqual(self.store.require(self.session, '1')['mode'], '1')
+        self.assertEqual(self.store.get(self.session)['selection_source'], 'auto_by_dispatch')
+        self.store.finish(self.session, 'done', [])
+        self.store.submitted(self.session, '模式二', [])
+        with self.assertRaises(ValueError):
+            self.store.require(self.session, '1')
+
+    def test_bare_answer_changes_an_auto_pick(self):
+        self.store.begin(self.session, self.project, 'task', '2')
+        self.store.submitted(self.session, '一吧', [])
+        state = self.store.get(self.session)
+        self.assertEqual((state['mode'], state['selection_source']), ('1', 'explicit_user_prompt'))
+
+    def test_pinyin_and_english_mode_words(self):
+        for prompt, mode in [('moshi 2', '2'), ('Moshi2', '2'), ('mode 1', '1'), ('mode 2 帮我改', '2'), ('用moshi1做', '1')]:
+            with self.subTest(prompt=prompt):
+                self.assertEqual(modes.parse_choice(prompt), mode)
+        for prompt in ['mode 2 是什么意思', 'not mode 1', 'dark mode 2']:
+            with self.subTest(prompt=prompt):
+                self.assertIsNone(modes.parse_choice(prompt))
 
     def test_choice_with_task_and_persistence_during_clarification(self):
         self.hook('UserPromptSubmit',prompt='模式二：修改文件')
@@ -66,22 +102,29 @@ class ModeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.store.require(self.session,'1')
 
-    def test_finish_clears_mode_and_future_task_inherits_last_mode(self):
-        self.hook('UserPromptSubmit',prompt='模式二')
-        self.store.begin(self.session,self.project,'task')
-        self.store.finish(self.session,'verified file',[])
+    def test_finish_clears_mode_and_next_task_is_chosen_again_without_asking(self):
+        self.hook('UserPromptSubmit', prompt='模式二')
+        self.store.begin(self.session, self.project, 'task')
+        self.store.finish(self.session, 'verified file', [])
         self.assertIsNone(self.store.get(self.session)['mode'])
-        reminder=self.hook('Stop',last_assistant_message='完成')
-        self.assertEqual(reminder['decision'],'block')
-        self.assertEqual(self.hook('Stop',last_assistant_message='完成',stop_hook_active=True),{})
-        self.assertEqual(self.hook('Stop',last_assistant_message='模式一还是模式二？'),{})
-        self.hook('UserPromptSubmit',prompt='再帮我做另一个任务')
-        state=self.store.get(self.session)
-        self.assertEqual(state['mode'],'2')
-        self.assertEqual(state['last_mode'],'2')
-        self.assertEqual(state['selection_source'],'default_last_mode')
-        self.assertIn('沿用',self.store.guidance(state))
-        self.assertEqual(self.hook('PreToolUse',tool_name='Write',tool_input={}),{})
+        self.assertEqual(self.hook('Stop', last_assistant_message='完成'), {})
+        response = self.hook('UserPromptSubmit', prompt='再帮我做另一个任务')
+        state = self.store.get(self.session)
+        self.assertIsNone(state['mode'])
+        self.assertEqual(state['last_mode'], '2')
+        context = response['hookSpecificOutput']['additionalContext']
+        self.assertIn('上次为模式二', context)
+        self.assertIn('按任务难度', context)
+        self.assertEqual(self.hook('PreToolUse', tool_name='Write', tool_input={}), {})
+
+    def test_turn_end_parks_task_without_forcing_finish_or_menu(self):
+        self.hook('UserPromptSubmit', prompt='模式一')
+        self.store.begin(self.session, self.project, 'task')
+        self.assertEqual(self.hook('Stop', last_assistant_message='做完了，没有任何提示'), {})
+        state = self.store.get(self.session)
+        self.assertEqual((state['mode'], state['phase']), ('1', 'ready'))
+        self.hook('UserPromptSubmit', prompt='再补一点')
+        self.assertEqual(self.store.get(self.session)['mode'], '1')
 
     def test_informal_choices(self):
         for prompt in ['1','一','模式1','模式一','模式 １','一吧','用1','就用一吧','那就模式1吧','我觉得模式一吧','模式1：不要删除文件']:
@@ -98,29 +141,29 @@ class ModeTests(unittest.TestCase):
             with self.subTest(prompt=prompt):
                 self.assertIsNone(modes.parse_choice(prompt))
 
-    def test_new_session_inherits_preference_without_changing_active_sessions(self):
-        self.store.submitted('session-a','模式一',[])
-        self.store.submitted('session-b','帮我修复文件',[])
-        self.assertEqual(self.store.get('session-b')['mode'],'1')
-        self.store.submitted('session-c','模式二',[])
-        self.assertEqual(self.store.get('session-a')['mode'],'1')
-        self.assertEqual(self.store.get('session-b')['mode'],'1')
-        self.store.submitted('session-d','继续',[])
-        self.assertEqual(self.store.get('session-d')['mode'],'2')
+    def test_new_session_is_not_forced_and_does_not_change_active_sessions(self):
+        self.store.submitted('session-a', '模式一', [])
+        self.store.submitted('session-b', '帮我修复文件', [])
+        self.assertIsNone(self.store.get('session-b')['mode'])
+        self.store.submitted('session-c', '模式二', [])
+        self.assertEqual(self.store.get('session-a')['mode'], '1')
+        self.assertIsNone(self.store.get('session-b')['mode'])
+        self.assertEqual(self.store.begin('session-d', self.project, 'x')['mode'], '2')
 
     def test_session_last_mode_wins_over_another_session_preference(self):
-        self.store.submitted('session-a','模式一',[])
-        self.store.finish('session-a','done',[])
-        self.store.submitted('session-b','模式二',[])
-        self.store.submitted('session-a','再来一个任务',[])
-        self.assertEqual(self.store.get('session-a')['mode'],'1')
+        self.store.submitted('session-a', '模式一', [])
+        self.store.finish('session-a', 'done', [])
+        self.store.submitted('session-b', '模式二', [])
+        self.store.submitted('session-a', '再来一个任务', [])
+        self.assertIsNone(self.store.get('session-a')['mode'])
+        self.assertEqual(self.store.begin('session-a', self.project, 'x')['mode'], '1')
 
     def test_existing_installation_migrates_last_saved_choice(self):
         with self.store.edit('legacy') as state:
-            state.update(mode=None,last_mode='2',phase='awaiting_choice',selection_source='transcript_sync')
-        state=self.store.submitted(self.session,'继续执行',[])
-        self.assertEqual(state['mode'],'2')
-        self.assertEqual(state['selection_source'],'default_last_mode')
+            state.update(mode=None, last_mode='2', phase='awaiting_choice', selection_source='transcript_sync')
+        self.assertIsNone(self.store.submitted(self.session, '继续执行', [])['mode'])
+        state = self.store.begin(self.session, self.project, 'x')
+        self.assertEqual((state['mode'], state['selection_source']), ('2', 'auto_by_claude'))
 
     def test_legacy_state_without_choice_evidence_does_not_set_default(self):
         with self.store.edit('synthetic') as state:
@@ -128,18 +171,17 @@ class ModeTests(unittest.TestCase):
         self.assertIsNone(self.store.submitted(self.session,'继续执行',[])['mode'])
 
     def test_session_start_shows_inherited_preference_without_consuming_task(self):
-        self.store.submitted('previous','模式二',[])
-        response=self.hook('SessionStart')
-        self.assertIn('上次为模式二',response['hookSpecificOutput']['additionalContext'])
-        self.assertIn('不必等待确认',response['hookSpecificOutput']['additionalContext'])
+        self.store.submitted('previous', '模式二', [])
+        response = self.hook('SessionStart')
+        self.assertIn('不要问用户', response['hookSpecificOutput']['additionalContext'])
         self.assertIsNone(self.store.get(self.session)['mode'])
 
-    def test_unanswered_native_mode_question_defaults_to_history(self):
-        self.store.submitted('previous','模式二',[])
-        response=self.hook('PostToolUse',tool_name='AskUserQuestion',
-            tool_input={'questions':[{'question':'模式1还是模式2？'}]},tool_response={'answers':{}})
-        self.assertEqual(self.store.get(self.session)['mode'],'2')
-        self.assertIn('沿用',response['hookSpecificOutput']['additionalContext'])
+    def test_unanswered_native_mode_question_leaves_choice_to_claude(self):
+        self.store.submitted('previous', '模式二', [])
+        response = self.hook('PostToolUse', tool_name='AskUserQuestion',
+            tool_input={'questions': [{'question': '模式1还是模式2？'}]}, tool_response={'answers': {}})
+        self.assertIsNone(self.store.get(self.session)['mode'])
+        self.assertIn('不要问用户', response['hookSpecificOutput']['additionalContext'])
 
     def test_unanswered_first_mode_question_still_needs_real_choice(self):
         self.hook('PostToolUse',tool_name='AskUserQuestion',
@@ -163,12 +205,11 @@ class ModeTests(unittest.TestCase):
         self.store.submitted(self.session,'2',[])
         self.assertEqual(self.store.get(self.session)['mode'],'1')
 
-    def test_defaulted_mode_accepts_bare_switch_during_work(self):
-        self.store.submitted('previous','模式二',[])
-        self.store.submitted(self.session,'继续',[])
-        self.store.begin(self.session,self.project,'work')
-        self.store.submitted(self.session,'一吧',[])
-        self.assertEqual(self.store.get(self.session)['mode'],'1')
+    def test_auto_mode_accepts_bare_switch_during_work(self):
+        self.store.submitted(self.session, '继续', [])
+        self.store.begin(self.session, self.project, 'work', '2')
+        self.store.submitted(self.session, '一吧', [])
+        self.assertEqual(self.store.get(self.session)['mode'], '1')
 
     def transcript(self, records):
         path=self.project/'transcript.jsonl'
@@ -189,30 +230,26 @@ class ModeTests(unittest.TestCase):
         self.assertEqual(state['selection_evidence']['source'],'user_prompt')
 
     def test_sync_ignores_tools_meta_and_unprompted_bare_numbers(self):
-        path=self.transcript([
+        path = self.transcript([
             self.user_record('帮我检查文件'),
-            {'type':'assistant','message':{'content':[{'type':'text','text':'要检查几个文件？'}]}},
+            {'type': 'assistant', 'message': {'content': [{'type': 'text', 'text': '要检查几个文件？'}]}},
             self.user_record('1'),
-            self.user_record('模式二',isMeta=True),
-            {'type':'user','message':{'content':'模式二'},'origin':{'kind':'tool'}},
-            {'type':'user','message':{'content':[{'type':'tool_result','content':'模式二'}]}},
+            self.user_record('模式二', isMeta=True),
+            {'type': 'user', 'message': {'content': '模式二'}, 'origin': {'kind': 'tool'}},
+            {'type': 'user', 'message': {'content': [{'type': 'tool_result', 'content': '模式二'}]}},
         ])
-        with self.assertRaises(ValueError):
-            self.store.sync(self.session,path,[])
+        self.assertIsNone(self.store.sync(self.session, path, [])['mode'])
 
     def test_sync_accepts_bare_first_choice(self):
         path=self.transcript([self.user_record('二吧')])
         self.assertEqual(self.store.sync(self.session,path,[])['mode'],'2')
 
-    def test_sync_accepts_bare_override_of_defaulted_mode(self):
-        self.store.submitted('previous','模式二',[])
-        with patch.object(modes,'now',return_value='2026-01-01T00:00:01.000Z'):
-            self.store.submitted(self.session,'继续',[])
-        self.store.begin(self.session,self.project,'work')
-        path=self.transcript([
-            {'type':'assistant','message':{'content':[{'type':'text','text':'本次沿用上次方式'}]}},
-            self.user_record('1','2026-01-01T00:00:02.000Z')])
-        self.assertEqual(self.store.sync(self.session,path,[])['mode'],'1')
+    def test_sync_accepts_bare_override_of_auto_mode(self):
+        self.store.begin(self.session, self.project, 'work', '2')
+        path = self.transcript([
+            {'type': 'assistant', 'message': {'content': [{'type': 'text', 'text': '本次我选了模式二'}]}},
+            self.user_record('1', '2999-01-01T00:00:02.000Z')])
+        self.assertEqual(self.store.sync(self.session, path, [])['mode'], '1')
 
     def test_sync_native_question_uses_numeric_menu_and_matched_answer(self):
         question='本次用模式1还是模式2？'
@@ -221,12 +258,12 @@ class ModeTests(unittest.TestCase):
         self.assertEqual(self.store.sync(self.session,path,[])['mode'],'2')
 
     def test_sync_after_finish_does_not_replay_old_selection(self):
-        path=self.transcript([self.user_record('模式一')])
-        self.store.sync(self.session,path,[])
-        self.store.finish(self.session,'done',[])
-        state=self.store.sync(self.session,path,[])
-        self.assertEqual(state['mode'],'1')
-        self.assertEqual(state['selection_source'],'default_last_mode')
+        path = self.transcript([self.user_record('模式一')])
+        self.store.sync(self.session, path, [])
+        self.store.finish(self.session, 'done', [])
+        state = self.store.sync(self.session, path, [])
+        self.assertIsNone(state['mode'])
+        self.assertEqual(state['last_mode'], '1')
 
     def test_sync_detects_new_explicit_switch_and_preserves_worker_handoff(self):
         with patch.object(modes,'now',return_value='2026-01-01T00:00:01.000Z'):
@@ -259,8 +296,7 @@ class ModeTests(unittest.TestCase):
                 self.assertEqual(state['phase'],'awaiting_choice')
         for tool in ['mcp__ccd_turn__execute','mcp__ccd_turn__wrap_up_extra','mcp__other__wrap_up']:
             with self.subTest(tool=tool):
-                response=self.hook('PreToolUse',tool_name=tool,tool_input={})
-                self.assertEqual(response['hookSpecificOutput']['permissionDecision'],'deny')
+                self.assertEqual(self.hook('PreToolUse',tool_name=tool,tool_input={}),{})
 
     def test_desktop_metadata_does_not_begin_ready_task(self):
         self.store.submitted(self.session,'模式二',[])

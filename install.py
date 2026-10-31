@@ -112,6 +112,8 @@ def main(hook_transport=None):
     targets += [PREFIX / name for name in MODULES if PREFIX / name not in targets]
     reference = HOME / '.claude/skills/codex-loop/references/contracts.md'
     targets.append(reference)
+    template = reference.parent / 'spec-template.json'
+    targets.append(template)
     plugin_files = [".claude-plugin/plugin.json", "hooks/hooks.json", "hooks/hooks.mjs"]
     targets += [PREFIX / "desktop-plugin" / name for name in plugin_files + ["bridge.json"]]
     if os.name == 'nt':
@@ -153,12 +155,13 @@ def main(hook_transport=None):
         skill.write_text((SOURCE / "claude-skill/SKILL.md").read_text(encoding="utf-8").replace("@CCL@", skill_command), encoding="utf-8")
         reference.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(SOURCE / 'claude-skill/references/contracts.md', reference)
+        shutil.copy2(SOURCE / 'claude-skill/references/spec-template.json', template)
         entry = HOME / ".claude/skills/work-mode/SKILL.md"
         entry.parent.mkdir(parents=True, exist_ok=True)
         entry.write_text((SOURCE / "mode-skill/SKILL.md").read_text(encoding="utf-8").replace("@CCL@", skill_command), encoding="utf-8")
-        block(HOME / ".claude/CLAUDE.md", """## 执行模式：可选 1/2，未回答沿用上次
-每次新任务先加载 `work-mode`，可见提示模式一（1，Claude 规划和验收、Codex 执行）与模式二（2，全部由 Claude 完成）。用户可回答 1、2、一、二、模式1、模式二、二吧、就用1，也可把模式与任务一起说。没有明确选择时沿用本 session 上次模式，否则沿用用户最近明确选择的偏好，并告知本次沿用哪种及可回复 1/2 切换；有历史时不阻塞等待。完全没有历史才询问一次等待真实选择，不自行猜测。
-先看 hook 状态；若桌面端 hook 没有记录真实回复，使用 `ccl mode sync --session SESSION` 从本机会话记录同步，再执行；不让用户反复重输，不伪造状态。同任务补充和返修沿用当前模式，不反复询问。模式一加载 `codex-loop`；模式二不调用 Codex。只有选择没有任务时保留选择并等待任务。结束本次任务后保留历史偏好，回复末尾提示“下一项可选模式一或二，不选沿用上次”；不能因用户暂时没回复而启动额外工作。切换先停止旧执行者、保存现场，再交接。
+        block(HOME / ".claude/CLAUDE.md", """## 执行模式：用户指定照办，未指定按难度自选
+每次新任务先加载 `work-mode`。用户明确说了模式（1、2、一、二、模式1、模式二、mode 2、moshi 2，或“用模式二做”）就严格照办；没说就由你按任务难度自己选，并在开头用一句话告知所选模式（回复 1/2 可改）：问答、调研、小改动、配置部署、几步内能做完 → 模式二（自己做）；多文件、长耗时、批量、需独立验收 → 模式一（`ccl new/run` 交给 Codex）。不要问用户、不要等确认、不要因门禁报错停下。
+同一任务的补充和返修沿用已选模式；新任务难度明显不同且模式是你自选的可以重选。hook 没记录用户的选择时用 `ccl mode sync --session SESSION`，不伪造状态。模式一加载 `codex-loop`；模式二不调用 Codex。最终回复用一句话说明所用模式即可，不必附选择提示。切换先停止旧执行者、保存现场，再交接。
 模式一统一用 ccl new/run 非交互执行（approval_policy=never、sandbox_mode=danger-full-access）；不要另开交互式 Codex 终端或加 on-request/--full-auto 覆盖权限。只有用户明确要求时才收紧沙箱。已授权执行不逐条询问 Yes/No。
 读项目 `.ai-collab/MEMORY.md` 与 `~/.config/claude-codex-loop/SHARED_MEMORY.md`。本机可选访问交接见 `~/.config/claude-codex-loop/ACCESS_HANDOFF.md`，存在时按需读取。沿用已有授权；模式不扩大外部操作权限。技能不可用时读 `~/.claude/skills/work-mode/SKILL.md`。""")
         block(HOME / ".codex/AGENTS.md", """## Claude/Codex 共享项目上下文
@@ -170,7 +173,7 @@ def main(hook_transport=None):
             for line in ["- 用户与 Claude Code 对话；Claude 规划、调度并验收。\n", "- Codex 承担具体执行、测试和返修，以减少 Claude 调用。\n"]:
                 old = old.replace(line, "")
             shared.write_text(old, encoding="utf-8")
-        block(shared, "## 执行模式约定\n- 新任务提示模式一（Claude 统筹、Codex 执行）或模式二（仅 Claude）；接受 1/2/一/二/模式1/模式二及明确的口语选择。\n- 没有回答选择时沿用本 session 上次模式，否则沿用最近明确选择的偏好；完全无历史才等待选择。\n- 活跃任务按 session 隔离，同任务不重复问；任务结束保留偏好，下一项未指定就沿用。仅有时间流逝不能启动新任务。\n- 两种模式共用项目 .ai-collab/MEMORY.md，仅保存已验证事实和决策，不保存本次模式状态。")
+        block(shared, "## 执行模式约定\n- 用户明确指定模式一（Claude 统筹、Codex 执行）或模式二（仅 Claude）就照办；接受 1/2/一/二/模式1/模式二/mode 2/moshi 2 及明确的口语选择。\n- 没指定时由 Claude 按任务难度自选并告知，不询问用户；同任务沿用，新任务可重选。\n- 活跃任务按 session 隔离。仅有时间流逝不能启动新任务。\n- 两种模式共用项目 .ai-collab/MEMORY.md，仅保存已验证事实和决策，不保存本次模式状态。")
         configure_hooks(settings, hook_transport)
         settings_path.write_text(json.dumps(settings, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         if os.name == 'nt':

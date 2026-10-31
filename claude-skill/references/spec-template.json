@@ -1,0 +1,22 @@
+{
+  "title": "简短任务名（动词开头）",
+  "goal": "用户的原始完整目标 + 已授权范围（例：可修改 D:/proj/src 下文件；不得 commit/push）",
+  "plan": "1) 先读哪些文件/做什么调查 2) 实施步骤 3) 需要的环境，例如 Python 用 D:/Anaconda/envs/tslib_findpeaks/python.exe 4) 自己运行测试并返修，最后写 report.md 说明改动与验证",
+  "acceptance": [
+    "可观察的完成条件 1（例：python -m unittest 全部通过）",
+    "可观察的完成条件 2（例：report.md 列出每个改动文件和验证命令输出）"
+  ],
+  "constraints": [
+    "只允许修改：相对路径列表",
+    "保留既有未提交工作，不得删除无关文件",
+    "不得 commit / push / 发布 / 发消息，除非 goal 明确授权",
+    "不得读取或输出任何凭据、token"
+  ],
+  "artifacts": ["report.md"],
+  "checks": [
+    {"name": "单元测试", "argv": ["D:/Anaconda/envs/tslib_findpeaks/python.exe", "-m", "unittest", "discover", "-s", "tests"], "timeout": 300}
+  ],
+  "verification_files": [],
+  "context_files": [],
+  "required_capabilities": []
+}

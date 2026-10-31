@@ -242,15 +242,16 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(task['verification']['automated_check_count'], 0)
         self.assertEqual(ccl.review(task['id'], 'accept', 'Read and verified report')['state'], 'accepted')
 
-    def test_selected_mode_one_completes_loop_then_requires_new_choice(self):
+    def test_selected_mode_one_completes_loop_then_next_dispatch_picks_mode_one_itself(self):
         session = 'mode-one-owner'
         task = self.run_task(self.create(owner=session))
         ccl.review(task['id'], 'accept', 'Read artifact and verification output')
         store = ccl.modes.ModeStore(ccl.STATE)
         state = store.finish(session, 'accepted task', ccl.owned_tasks(session))
         self.assertIsNone(state['mode'])
-        with self.assertRaises(ValueError):
-            ccl.create(self.project, self.spec, owner=session)
+        ccl.create(self.project, self.spec, owner=session)
+        state = store.get(session)
+        self.assertEqual((state['mode'], state['selection_source']), ('1', 'auto_by_dispatch'))
 
 
 if __name__ == '__main__':

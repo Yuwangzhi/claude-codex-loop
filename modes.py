@@ -10,7 +10,10 @@ import tempfile
 import unicodedata
 import runtime
 
-MENU = "请选择本次执行模式：模式一（1）Claude 统筹、Codex 执行；模式二（2）全部由 Claude 完成。回复 1 / 2 / 一 / 二 / 模式1 / 模式二 都行，也可以把模式和任务一起说；未明确选择时沿用上次模式，首次没有历史时需选择一次。"
+MENU = "未指定模式时由 Claude 按任务难度自动选择，不会询问；想指定可回复 1（模式一：Claude 统筹、Codex 执行）或 2（模式二：全部由 Claude 完成），例如“模式2”“moshi 2”。"
+MODE = r"(?:模式|moshi|mode)"
+EXPLICIT_SOURCES = ("explicit_user_prompt", "transcript_sync")
+AUTO_SOURCES = ("default_last_mode", "auto_by_claude", "auto_by_dispatch")
 LABELS = {"1": "模式一：Claude 统筹、Codex 执行", "2": "模式二：全部由 Claude 完成"}
 DIGITS = {"1": "1", "一": "1", "2": "2", "二": "2"}
 DESKTOP_METADATA_TOOLS = frozenset({"mcp__ccd_turn__wrap_up", "mcp__ccd_turn__update_plan"})
@@ -42,13 +45,13 @@ def parse_choice(prompt, awaiting=True):
         return None
     if re.search(r"(?:什么|区别|差别|解释|介绍|说明|比较|哪个好|可以吗|行吗|能否|是否)", clause):
         return None
-    named = {DIGITS[d] for d in re.findall(r"模式\s*([12一二])(?![0-9一二])", clause)}
-    if len(named) > 1 or re.search(r"模式\s*(?:12|一二|[1一]\s*(?:/|或|和|、|or)\s*[2二])", clause, re.I):
+    named = {DIGITS[d] for d in re.findall(MODE + r"\s*([12一二])(?![0-9一二])", clause, re.I)}
+    if len(named) > 1 or re.search(MODE + r"\s*(?:12|一二|[1一]\s*(?:/|或|和|、|or)\s*[2二])", clause, re.I):
         return None
     # A named mode must begin a selection clause, not occur in quoted task content.
     prefix = r"(?:(?:那就|那|就|还是|要不|这次|本次|我觉得|我想|我|请|麻烦|先|暂时)\s*)*"
     verb = r"(?:(?:选择|选|切换到|切换为|切换|改用|采用|使用|用|按)\s*)?"
-    match = re.match(r"^" + prefix + verb + r"模式\s*([12一二])(?![0-9一二])", text)
+    match = re.match(r"^" + prefix + verb + MODE + r"\s*([12一二])(?![0-9一二])", text, re.I)
     if match:
         suffix = text[match.end():]
         if not suffix or re.match(r"^(?:吧|啊|呀|呢|好了|就行|即可|开始|继续|执行|来|做|，|,|。|\.|!|！|:|：|;|；|\s)", suffix):
@@ -258,6 +261,10 @@ class ModeStore:
             state["phase"] = "working" if state["phase"] in ("working", "waiting_input", "switch_pending") else "ready"
             state["selection_source"] = source
 
+    @staticmethod
+    def explicit(state):
+        return state.get("selection_source") in EXPLICIT_SOURCES
+
     def hook_seen(self, session):
         with self.edit(session) as state:
             state["hook_seen_at"] = now()
@@ -267,13 +274,11 @@ class ModeStore:
             state["turn"] += 1
             state["hook_seen_at"] = now()
             choice = parse_choice(prompt, choice_context or state["phase"] in ("awaiting_choice", "ready") or
-                                  state.get("selection_source") == "default_last_mode")
+                                  state.get("selection_source") in AUTO_SOURCES)
             if choice:
                 self.apply_choice(state, choice, open_tasks, "explicit_user_prompt")
                 state["selection_at"] = now()
                 self.remember_choice(state)
-            elif state["phase"] == "awaiting_choice" and self.fallback_mode(state):
-                self.apply_choice(state, self.fallback_mode(state), open_tasks, "default_last_mode")
             elif state["phase"] == "waiting_input":
                 state["phase"] = "working"
             state.pop("reminder_sent", None)
@@ -283,18 +288,13 @@ class ModeStore:
         """Recover a real choice when a host has omitted settings hooks."""
         with self.edit(session) as state:
             since = max(filter(None, [state.get("finished_at"), state.get("selection_at"), state.get("synced_at")]), default=None)
-            defaulted = state.get("selection_source") == "default_last_mode" or (
+            defaulted = state.get("selection_source") in AUTO_SOURCES or (
                 not state["mode"] and bool(self.fallback_mode(state)))
             found = transcript_choices(transcript, since, defaulted=defaulted)
             if found:
                 self.apply_choice(state, found[-1]["choice"], open_tasks, "transcript_sync")
                 state["selection_evidence"] = dict(found[-1], transcript=str(transcript))
                 self.remember_choice(state)
-            elif not state["mode"]:
-                fallback = self.fallback_mode(state)
-                if not fallback:
-                    raise ValueError("会话记录里没有找到用户的模式选择，也没有上次模式可沿用；请回复 1 或 2")
-                self.apply_choice(state, fallback, open_tasks, "default_last_mode")
             state["synced_at"] = now()
         return self.get(session)
 
@@ -312,16 +312,29 @@ class ModeStore:
         return self.get(session)
 
     def require(self, session, mode=None):
+        """Check (and, when the user has not decided otherwise, set) the executor for a dispatch."""
         state = self.get(session)
-        if state.get("pending_mode") or not state["mode"]:
-            raise ValueError("User mode selection/transition is required before execution; use ccl mode sync if the user already answered")
+        if state.get("pending_mode"):
+            raise ValueError("A user-requested mode switch is pending; stop the old executor, then ccl mode activate")
         if mode and state["mode"] != mode:
-            raise ValueError("Current choice is " + LABELS[state["mode"]] + "; Codex dispatch is disabled")
+            if state["mode"] and (self.explicit(state) or mode == "2"):
+                raise ValueError("Current choice is " + LABELS[state["mode"]] + "; this action belongs to " + LABELS[mode])
+            # No mode yet, or Claude's own earlier pick: following the dispatch is the decision.
+            with self.edit(session) as current:
+                current.update(mode=mode, selection_source="auto_by_dispatch", selection_at=now())
+                if current["phase"] not in ("working", "waiting_input"):
+                    current["phase"] = "ready"
+            state = self.get(session)
         return state
 
-    def begin(self, session, project, summary):
-        self.require(session)
+    def begin(self, session, project, summary, mode=None, open_tasks=()):
         with self.edit(session) as state:
+            if state.get("pending_mode"):
+                raise ValueError("A user-requested mode switch is pending; stop the old executor, then ccl mode activate")
+            if not state["mode"]:
+                state.update(mode=mode or self.fallback_mode(state) or "2", selection_source="auto_by_claude", selection_at=now())
+            elif mode and mode != state["mode"] and not self.explicit(state) and not open_tasks:
+                state.update(mode=mode, selection_source="auto_by_claude", selection_at=now())
             state.update(phase="working", project=str(project), summary=summary[:1000])
         return self.get(session)
 
@@ -336,30 +349,34 @@ class ModeStore:
         if not note.strip() or open_tasks:
             raise ValueError("Completion needs evidence/summary and all CCL tasks must be closed")
         with self.edit(session) as state:
-            state["history"].append({"mode": state["mode"], "project": state.get("project"), "note": note[:2000]})
-            state["history"] = state["history"][-50:]
-            state["last_mode"] = state["mode"]
+            if state["mode"]:
+                state["history"].append({"mode": state["mode"], "project": state.get("project"), "note": note[:2000]})
+                state["history"] = state["history"][-50:]
+                state["last_mode"] = state["mode"]
             state.update(mode=None, phase="awaiting_choice", pending_mode=None, finished_at=now())
             state.pop("selection_evidence", None)
+            state.pop("selection_source", None)
         return self.get(session)
 
     def guidance(self, state):
         if state.get("pending_mode"):
             return ("用户已要求切换到" + LABELS[state["pending_mode"]] +
                     "。先停止并等待现有 Codex 后台任务退出，检查现场，保留产物，关闭旧 CCL 任务（取消原因写明交接），再运行 ccl mode activate --session SESSION。不要同时启动两个执行者。")
+        rule = ("规则：用户明确指定模式就严格照办；没指定时由你按任务难度自己选，不要问用户、不要等确认、不要因门禁报错而停下。"
+                "判断：问答、调研、单文件或小改动、配置/部署、几步内能做完 → 模式二（自己做）；多文件改动、长耗时、批量处理、需要独立执行与独立验收 → 模式一（ccl new/run 交给 Codex）。"
+                "同一任务的补充和返修沿用已选模式；新任务难度明显不同时，用 ccl mode begin --mode N 重选（用户明确选过的除外）。")
         if not state["mode"]:
-            fallback = self.fallback_mode(state)
-            if fallback:
-                return MENU + " 上次为" + LABELS[fallback] + "。新任务未明确选择时，运行 ccl mode sync --session SESSION 沿用上次并继续；用一句话告知用户即可，不必等待确认。"
-            return MENU + " 这是首次选择，没有历史可沿用；先给出两个选项并等待真实选择。已回答但 hook 未记录时运行 ccl mode sync --session SESSION。"
-        text = ("本次未明确选择，按用户约定沿用上次的" if state.get("selection_source") == "default_last_mode" else "已由用户选择") + LABELS[state["mode"]] + "。"
-        if state.get("selection_source") == "default_last_mode":
-            text += "开头简短告知本次沿用该模式，并提示回复模式1或模式2可切换；无需等待确认。"
+            hint = "上次为" + LABELS[state["last_mode"]] + "，仅供参考。" if state.get("last_mode") in LABELS else ""
+            return ("本次用户未指定执行模式。" + rule + hint +
+                    "开工前运行 ccl mode begin --session SESSION --project 项目 --mode 1或2 --note 目标；直接 ccl new 视为选模式一。"
+                    "开头用一句话告知所选模式及理由，并说明回复 1/2 可改。")
+        who = "已由用户明确选择" if self.explicit(state) else "已由 Claude 按任务难度选定"
+        text = who + LABELS[state["mode"]] + "。" + rule
         if state["mode"] == "1":
             text += "使用 codex-loop / ccl new/run 非交互交接具体工作；默认 approval_policy=never、sandbox_mode=danger-full-access。不要另开交互式 codex 终端，不要加 on-request、--full-auto 或把默认权限改回 workspace-write；除非用户本次明确要求收紧权限。已授权任务不逐条要求用户点击 Yes/No。"
         else:
             text += "由 Claude 自己规划、执行、自测和总结，不调用 Codex 或 codex-loop 执行器。"
-        return text + "同一任务持续沿用，不反复询问。执行前 mode begin；任务完成、记录共享记忆后 mode finish；最后提示下一项任务可选模式一或模式二，未明确选择沿用本次模式。需要澄清时 mode wait，保留当前模式。"
+        return text + "任务真正完成并记录共享记忆后运行 mode finish；需要用户补充信息时 mode wait。最终回复不必再附模式选择提示。"
 
     def pretool(self, session, tool, args):
         state = self.get(session)
@@ -368,15 +385,11 @@ class ModeStore:
         if tool in DESKTOP_METADATA_TOOLS:
             return {}
         reason = None
-        if not state["mode"]:
-            allowed = tool in ("AskUserQuestion", "Skill") or (tool in ("Bash", "PowerShell") and control_command(args.get("command", "")))
-            if not allowed:
-                reason = "用户要求先选模式再执行。" + MENU
-        elif state.get("pending_mode"):
+        if state.get("pending_mode"):
             if dispatches_codex(tool, args) or tool in ("Write", "Edit", "NotebookEdit", "Agent", "Task"):
                 reason = "正在交接模式；先停止并关闭旧执行任务，保留成果，再激活新模式。"
-        elif state["mode"] == "2" and dispatches_codex(tool, args):
-            reason = "用户选了模式二：全部由 Claude 完成，不能派发给 Codex。"
+        elif state["mode"] == "2" and self.explicit(state) and dispatches_codex(tool, args):
+            reason = "用户明确选了模式二：全部由 Claude 完成，不能派发给 Codex。"
         if reason:
             return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason}}
         if state["phase"] == "ready" and tool not in ("Skill", "AskUserQuestion") and not (
@@ -386,16 +399,11 @@ class ModeStore:
         return {}
 
     def stopping(self, session, payload, open_tasks):
+        """End of turn: never force a menu or a finish call; park the task as ready for follow-ups."""
         state = self.get(session)
         if payload.get("stop_hook_active"):
             return {}
-        if state["phase"] == "working" and not open_tasks:
-            return {"decision": "block", "reason": "结束前请关闭模式任务：若已完成，先验证结果、记录有用共享记忆，再 ccl mode finish --session SESSION --note '完成与验证依据'；若需要用户补充，用 mode wait。随后在回复末尾提示下一项任务选择模式一或模式二。SESSION 用当前 session id。"}
-        if state["phase"] == "awaiting_choice":
-            message = payload.get("last_assistant_message", "")
-            menu_shown = has_menu(message)
-            if not menu_shown and not state.get("reminder_sent"):
-                with self.edit(session) as value:
-                    value["reminder_sent"] = True
-                return {"decision": "block", "reason": "请在回复末尾补充模式选择提示；有历史时下次未明确选择沿用上次：" + MENU}
+        if state["phase"] == "working" and not open_tasks and state["mode"]:
+            with self.edit(session) as current:
+                current.update(phase="ready", auto_closed_at=now())
         return {}

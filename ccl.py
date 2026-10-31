@@ -25,6 +25,8 @@ VERSION = "0.4.0"
 STATE = Path(os.environ.get("CCL_STATE_DIR", str(Path.home() / ".local/state/claude-codex-loop"))).expanduser()
 CONFIG = Path(os.environ.get("CCL_CONFIG_DIR", str(Path.home() / ".config/claude-codex-loop"))).expanduser()
 TERMINAL = {"accepted", "cancelled"}
+STARTUP_RETRIES = 2
+STARTUP_FAILURE_CODES = {0xC0000142}  # STATUS_DLL_INIT_FAILED: the process never started
 RESULT_SCHEMA = {
     "type": "object", "additionalProperties": False,
     "properties": {
@@ -240,9 +242,25 @@ def validate_spec(spec, project):
             raise ValueError("Check timeout must be 1..3600 seconds")
 
 
+def precheck_scripts(spec, project):
+    """A broken acceptance script wastes a whole Codex run, so refuse it before dispatch."""
+    names = list(spec.get("verification_files", []))
+    for check in spec.get("checks", []):
+        names += [a for a in check.get("argv", []) if isinstance(a, str) and a.endswith(".py")]
+    for name in dict.fromkeys(names):
+        path = Path(name)
+        path = path if path.is_absolute() else project / path
+        if path.suffix == ".py" and path.is_file():
+            try:
+                compile(path.read_text(encoding="utf-8"), str(path), "exec")
+            except (SyntaxError, ValueError) as e:
+                raise ValueError("Acceptance script does not compile; fix it before ccl new: %s: %s" % (name, e))
+
+
 def create(project, spec, owner="", attempts=3, sandbox="danger-full-access", timeout=1800,
            max_seconds=None, max_tokens=None):
     validate_spec(spec, project)
+    precheck_scripts(spec, project)
     if owner:
         modes.ModeStore(STATE).require(owner, "1")
     if not 1 <= attempts <= 5 or not 10 <= timeout <= 14400:
@@ -507,8 +525,14 @@ def run_task(task_id):
                 save_task(path, task)
             try:
                 env = dict(os.environ, CCL_WORKER="1")
-                rc = budgeted_process(task, 'worker', codex_argv(task, attempt), project, prompt, attempt / "events.jsonl",
-                             attempt / "stderr.log", task["timeout"], env, record_worker)
+                for launch in range(1 + STARTUP_RETRIES):
+                    rc = budgeted_process(task, 'worker', codex_argv(task, attempt), project, prompt, attempt / "events.jsonl",
+                                 attempt / "stderr.log", task["timeout"], env, record_worker)
+                    # No event at all means Codex never started: retry the launch without spending an attempt.
+                    # Every launch is still charged to the cumulative budget.
+                    if rc not in STARTUP_FAILURE_CODES or (attempt / "events.jsonl").stat().st_size:
+                        break
+                    time.sleep(3)
             except governance.BudgetExceeded as e:
                 rc, budget_failure = -1, True
                 task['feedback'] = str(e)
@@ -1080,6 +1104,7 @@ def main():
     mode.add_argument("--session", required=True)
     mode.add_argument("--project", default=".")
     mode.add_argument("--note", default="")
+    mode.add_argument("--mode", choices=["1", "2"], default=None, help="begin only: Claude's own pick when the user gave none")
     mode.add_argument("--transcript", default="", help="sync only; default: locate session transcript under Claude projects")
     transfer = sub.add_parser("adopt")
     transfer.add_argument("task")
@@ -1122,7 +1147,7 @@ def main():
                 transcript = Path(args.transcript).expanduser() if args.transcript else find_transcript(args.session)
                 output = store.sync(args.session, transcript, owned_tasks(args.session))
             elif args.action == "begin":
-                output = store.begin(args.session, project_dir(args.project), args.note)
+                output = store.begin(args.session, project_dir(args.project), args.note, args.mode, owned_tasks(args.session))
             elif args.action == "wait":
                 output = store.wait(args.session, args.note)
             elif args.action == "activate":
@@ -1135,7 +1160,11 @@ def main():
         elif args.command == "note":
             output = native_memory(project_dir(args.project), args.session, args.text, args.evidence)
         elif args.command == "new":
-            spec = json.load(sys.stdin) if args.spec == "-" else read_json(Path(args.spec))
+            try:
+                spec = json.load(sys.stdin) if args.spec == "-" else read_json(Path(args.spec))
+            except ValueError as e:
+                raise ValueError(str(e) + " | Write the spec to a UTF-8 .json file with the Write tool and pass --spec FILE; "
+                                 "use '/' in Windows paths (a single backslash is an invalid JSON escape).")
             task = create(project_dir(args.project), spec, args.owner_session, args.max_attempts, args.sandbox, args.timeout,
                           args.max_seconds, args.max_tokens)
             output = {"id": task["id"], "state": task["state"], "records": str(task_path(task["id"]))}
