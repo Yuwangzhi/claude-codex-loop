@@ -1,6 +1,9 @@
-// Claude Code 2.1.308+ mod bridge. Python remains the single mode-state owner.
-// No shell and no transcript/prompt logging: the original payload travels on stdin.
+// Claude Code native hook adapter. Python remains the single mode-state owner.
+// Uses the native event API (session.start / prompt.context / prompt.submit /
+// tool.call / turn.complete) so the built-in sec-default plugin can seat itself
+// outermost without skipping CCL's hooks.
 const FAILURE = 'CCL 模式检查失败，已暂停本次工具执行；请检查 CCL 安装后重试。';
+let sessionContext = '';
 
 function record(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -25,79 +28,110 @@ async function runHook($, payload) {
   return output;
 }
 
-function classicResult(output) {
-  const result = {};
+function contextText(output) {
   const specific = output.hookSpecificOutput;
   if (record(specific) && typeof specific.additionalContext === 'string' && specific.additionalContext) {
-    result.additionalContext = [specific.additionalContext];
+    return specific.additionalContext;
   }
-  if (output.decision === 'block') result.block = output.reason || 'CCL requires attention';
-  if (output.continue === false) {
-    result.preventContinuation = true;
-    if (typeof output.stopReason === 'string') result.stopReason = output.stopReason;
-  }
-  return result;
+  return '';
 }
 
-function mergeClassic(downstream, own) {
-  const result = { ...downstream, ...own };
-  if (downstream.additionalContext || own.additionalContext) {
-    result.additionalContext = [...(downstream.additionalContext || []), ...(own.additionalContext || [])];
-  }
-  if (downstream.block && own.block) result.block = downstream.block + '\n' + own.block;
-  if (downstream.preventContinuation) {
-    result.preventContinuation = true;
-    if (downstream.stopReason) result.stopReason = downstream.stopReason;
-  }
-  return result;
-}
-
-async function classic($, event, next) {
-  const output = await runHook($, event);
-  const downstream = await next(event);
-  // A command hook's systemMessage is user-facing rather than model context.
+function logMessage($, output) {
   if (typeof output.systemMessage === 'string' && output.systemMessage) $.ui.log(output.systemMessage);
-  return mergeClassic(downstream, classicResult(output));
 }
 
-async function preTool($, event, next) {
-  const { tool, tool_use_id, agentId, ...toolInput } = event;
-  const output = await runHook($, {
-    hook_event_name: 'PreToolUse',
-    session_id: await $.session.id(),
-    cwd: await $.session.cwd(),
-    tool_name: tool,
-    tool_use_id,
-    tool_input: toolInput,
-    ...(agentId ? { agent_id: agentId } : {}),
-  });
-  const downstream = await next(event);
-  const specific = output.hookSpecificOutput;
-  if (record(specific) && specific.permissionDecision === 'deny') {
-    // Never turn a later denial/ask into an allow, and keep later context.
-    const { allow, ask, deny, ...rest } = downstream;
-    const reason = specific.permissionDecisionReason || 'CCL refused this tool call';
-    return { ...rest, deny: deny ? deny + '\n' + reason : reason };
+function mergeBlocks(downstream, blocks) {
+  const base = record(downstream) && Array.isArray(downstream.blocks) ? downstream.blocks : [];
+  return { ...(record(downstream) ? downstream : {}), blocks: [...base, ...blocks] };
+}
+
+async function sessionStart($, event, next) {
+  try {
+    const out = await runHook($, {
+      hook_event_name: 'SessionStart',
+      session_id: await $.session.id(),
+      cwd: event.cwd || await $.session.cwd(),
+      source: event.source || 'startup',
+    });
+    logMessage($, out);
+    sessionContext = contextText(out);
+  } catch (err) {
+    sessionContext = FAILURE;
   }
-  return downstream;
+  return next(event);
 }
 
-async function contextFailure($, event, next) {
+async function promptContext($, event, next) {
   const downstream = await next(event);
-  return mergeClassic(downstream, { additionalContext: [FAILURE] });
+  if (!sessionContext) return downstream;
+  const block = { name: 'ccl-work-modes', text: sessionContext };
+  sessionContext = '';
+  return mergeBlocks(downstream, [block]);
+}
+
+async function promptSubmit($, event, next) {
+  let out;
+  try {
+    out = await runHook($, {
+      hook_event_name: 'UserPromptSubmit',
+      session_id: await $.session.id(),
+      cwd: await $.session.cwd(),
+      prompt: event.text || '',
+    });
+    logMessage($, out);
+  } catch (err) {
+    const downstream = await next(event);
+    const text = record(downstream) && typeof downstream.text === 'string' ? downstream.text : (event.text || '');
+    return { ...(record(downstream) ? downstream : {}), text: text + '\n\n' + FAILURE };
+  }
+  const downstream = await next(event);
+  const context = contextText(out);
+  if (!context) return downstream;
+  const text = record(downstream) && typeof downstream.text === 'string' ? downstream.text : (event.text || '');
+  return { ...(record(downstream) ? downstream : {}), text: text + '\n\n' + context };
+}
+
+async function toolCall($, event, next) {
+  const { tool, tool_use_id, ...toolInput } = event;
+  try {
+    const out = await runHook($, {
+      hook_event_name: 'PreToolUse',
+      session_id: await $.session.id(),
+      cwd: await $.session.cwd(),
+      tool_name: tool,
+      tool_use_id,
+      tool_input: toolInput,
+    });
+    logMessage($, out);
+    const specific = out.hookSpecificOutput;
+    if (record(specific) && specific.permissionDecision === 'deny') {
+      return { deny: specific.permissionDecisionReason || 'CCL refused this tool call' };
+    }
+  } catch (err) {
+    return { deny: FAILURE };
+  }
+  return next(event);
+}
+
+async function turnComplete($, event, next) {
+  try {
+    const out = await runHook($, {
+      hook_event_name: 'Stop',
+      session_id: await $.session.id(),
+      cwd: await $.session.cwd(),
+      stop_hook_active: false,
+    });
+    logMessage($, out);
+  } catch (err) {
+    // The turn has already finished; never turn a reporting failure into a loop.
+  }
+  return next(event);
 }
 
 export function register(on) {
-  on('classic.SessionStart', classic).catch(contextFailure);
-  on('classic.UserPromptSubmit', classic).catch(contextFailure);
-  on('classic.PostToolUse', async ($, event, next) => {
-    if (event.tool_name !== 'AskUserQuestion') return next(event);
-    return classic($, event, next);
-  }).catch(contextFailure);
-  on('classic.PreToolUse', preTool).catch(() => ({ deny: FAILURE }));
-  on('classic.Stop', classic).catch(async ($, event, next) => {
-    const downstream = await next(event);
-    if (event.stop_hook_active) return downstream;
-    return mergeClassic(downstream, { block: FAILURE });
-  });
+  on('session.start', sessionStart);
+  on('prompt.context', promptContext);
+  on('prompt.submit', promptSubmit);
+  on('tool.call', toolCall);
+  on('turn.complete', turnComplete);
 }
