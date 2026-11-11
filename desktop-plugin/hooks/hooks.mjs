@@ -1,9 +1,10 @@
 // Claude Code native hook adapter. Python remains the single mode-state owner.
-// Uses the native event API (session.start / prompt.context / prompt.submit /
-// tool.call / turn.complete) so the built-in sec-default plugin can seat itself
-// outermost without skipping CCL's hooks.
+// Uses the native event API (session.start / prompt.submit / tool.call /
+// turn.complete). SessionStart context is folded into the first prompt, because
+// the built-in sec-default plugin claims prompt.context before CCL can see it.
 const FAILURE = 'CCL 模式检查失败，已暂停本次工具执行；请检查 CCL 安装后重试。';
 let sessionContext = '';
+let sessionStarted = false;
 
 function record(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -40,11 +41,6 @@ function logMessage($, output) {
   if (typeof output.systemMessage === 'string' && output.systemMessage) $.ui.log(output.systemMessage);
 }
 
-function mergeBlocks(downstream, blocks) {
-  const base = record(downstream) && Array.isArray(downstream.blocks) ? downstream.blocks : [];
-  return { ...(record(downstream) ? downstream : {}), blocks: [...base, ...blocks] };
-}
-
 async function sessionStart($, event, next) {
   try {
     const out = await runHook($, {
@@ -55,40 +51,51 @@ async function sessionStart($, event, next) {
     });
     logMessage($, out);
     sessionContext = contextText(out);
+    sessionStarted = true;
   } catch (err) {
     sessionContext = FAILURE;
   }
   return next(event);
 }
 
-async function promptContext($, event, next) {
-  const downstream = await next(event);
-  if (!sessionContext) return downstream;
-  const block = { name: 'ccl-work-modes', text: sessionContext };
-  sessionContext = '';
-  return mergeBlocks(downstream, [block]);
-}
-
 async function promptSubmit($, event, next) {
-  let out;
+  let extra = '';
+  if (!sessionStarted) {
+    try {
+      const start = await runHook($, {
+        hook_event_name: 'SessionStart',
+        session_id: await $.session.id(),
+        cwd: await $.session.cwd(),
+        source: 'startup',
+      });
+      logMessage($, start);
+      extra += contextText(start);
+      sessionStarted = true;
+    } catch (err) {
+      extra += FAILURE;
+    }
+  }
+  if (sessionContext) {
+    extra += (extra ? '\n\n' : '') + sessionContext;
+    sessionContext = '';
+  }
   try {
-    out = await runHook($, {
+    const out = await runHook($, {
       hook_event_name: 'UserPromptSubmit',
       session_id: await $.session.id(),
       cwd: await $.session.cwd(),
       prompt: event.text || '',
     });
     logMessage($, out);
+    const context = contextText(out);
+    if (context) extra += (extra ? '\n\n' : '') + context;
   } catch (err) {
-    const downstream = await next(event);
-    const text = record(downstream) && typeof downstream.text === 'string' ? downstream.text : (event.text || '');
-    return { ...(record(downstream) ? downstream : {}), text: text + '\n\n' + FAILURE };
+    extra += (extra ? '\n\n' : '') + FAILURE;
   }
   const downstream = await next(event);
-  const context = contextText(out);
-  if (!context) return downstream;
+  if (!extra) return downstream;
   const text = record(downstream) && typeof downstream.text === 'string' ? downstream.text : (event.text || '');
-  return { ...(record(downstream) ? downstream : {}), text: text + '\n\n' + context };
+  return { ...(record(downstream) ? downstream : {}), text: text + '\n\n' + extra };
 }
 
 async function toolCall($, event, next) {
@@ -130,7 +137,6 @@ async function turnComplete($, event, next) {
 
 export function register(on) {
   on('session.start', sessionStart);
-  on('prompt.context', promptContext);
   on('prompt.submit', promptSubmit);
   on('tool.call', toolCall);
   on('turn.complete', turnComplete);
