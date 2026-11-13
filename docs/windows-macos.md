@@ -8,7 +8,7 @@
 | --- | --- | --- |
 | 启动器 | `ccl` POSIX shim | `ccl.cmd` 包装器（PowerShell 调用）；Git Bash 里仍用 `ccl` |
 | 安装命令 | `python3 install.py` | `python -X utf8 install.py` |
-| hooks 通路 | command hooks，或 `install.py --hook-transport module` | 桌面端常用 module 通路：`CLAUDE_CODE_PLUGIN_DIRS` 指向 `desktop-plugin`，`hooks.mjs` 调用 `ccl.py hook` |
+| hooks 通路 | 默认 command hooks，可用 `--hook-transport module` 切换 | 同上；已启用 module 时 `CLAUDE_CODE_PLUGIN_DIRS` 指向 `desktop-plugin`，由 `hooks.mjs` 调用 `ccl.py hook` |
 | Python 解释器 | 由 `python3` 解析 | 安装时固定的解释器，写入 `desktop-plugin/bridge.json` |
 | 路径与编码 | POSIX 路径 | `.cmd`、Git Bash、UTF-8 状态文件与 Windows 文件锁 |
 
@@ -21,12 +21,12 @@ module 通路的插件清单 `desktop-plugin/.claude-plugin/plugin.json` 中的 
 实际原因不是安装缺失，而是安装目录内模块版本不一致：
 
 - `ccl.py` 已更新到 0.4.3；
-- `modes.py` 仍是旧版本，没有 `ModeStore.recover_for_tool`；
+- `modes.py` 来自旧版本，没有 `ModeStore.recover_for_tool`；
 - `plugin.json` 停在 0.4.2。
 
 会话没有记录执行模式时，`PreToolUse` 会进入"从会话记录恢复模式"的分支，调用 `recover_for_tool` 抛出 `AttributeError`，hook 进程以非零码退出。`hooks.mjs` 对任何 hook 进程失败都返回同一句拒绝文案，模块异常因此显示成安装故障。
 
-同一版本在 macOS / Python 3.9 上通过测试；Windows 部署只替换了 `ccl.py`，没有同步 `modes.py`，所以问题只在 Windows 出现。
+同一版本的验收在 macOS / Python 3.9 上完成；出问题的 Windows 部署里 `ccl.py` 与 `modes.py` 版本不同步，模块通路又由 `hooks.mjs` 统一包装异常，所以只在 Windows 暴露。
 
 ## 升级与修复规则
 

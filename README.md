@@ -42,7 +42,7 @@ ccl --version
 
 重开 Claude Code 会话后直接说任务，例如“模式一：修复 CSV 导入错误并补回归测试”。环境要求、桌面端 hooks、Windows 与卸载见 [安装与卸载](docs/install.md)。
 
-Windows 与 macOS 的 hooks 通路和安装产物不同。升级时要整套替换模块，只换 `ccl.py` 会让 hook 调用 `modes.py` 中不存在的方法，并在客户端显示成“安装检查失败”。原因、探针和排查顺序见 [Windows 与 macOS](docs/windows-macos.md)。
+Windows 与 macOS 的 hooks 通路和安装产物不同。`ccl.py` 与 `modes.py` 版本不一致时，hook 会调用 `modes.py` 中不存在的方法，并在客户端显示成“CCL 模式检查失败”。原因、探针和排查顺序见 [Windows 与 macOS](docs/windows-macos.md)。
 
 ## 文档
 
