@@ -62,6 +62,8 @@ python -X utf8 install.py
 
 安装器会将用户 `.local/bin` 加到 Windows 用户 PATH 和 Git Bash 启动配置末尾，保留已有 CLI 的优先级。旧窗口的 PATH 不会热更新：重新打开终端和 Claude Code，或者先使用上面的绝对路径。Windows hooks 直接调用安装时的 Python，不依赖终端能否找到 `ccl`；skills 中的 shell 示例使用 Git Bash。npm 安装的 Codex 通过其 Node 入口启动，避免 `.cmd` 再次解析 JSON 参数。
 
+升级已有安装时，同一版本的 Python 模块和 `desktop-plugin` 要一起替换，不要只覆盖 `ccl.py`。模块不齐时 hook 进程会抛异常，客户端只显示统一的“CCL 模式检查失败”，容易被当成安装缺失。判断方法和探针见 [Windows 与 macOS](windows-macos.md)。
+
 ## 安装内容与卸载
 
 ```text
