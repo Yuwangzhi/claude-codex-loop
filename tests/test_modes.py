@@ -38,6 +38,76 @@ class ModeTests(unittest.TestCase):
             self.assertEqual(response['hookSpecificOutput']['permissionDecision'],'deny')
         self.assertEqual(self.hook('PreToolUse',tool_name='Skill',tool_input={'skill':'work-mode'}),{})
 
+    def test_bare_choice_clause_can_precede_task_without_accepting_task_numbers(self):
+        for prompt in ['2，然后修复问题并 push', '１：检查进度', '二吧\n继续任务', '就用1，修复2个错误']:
+            expected = '1' if '１' in prompt or '用1' in prompt else '2'
+            self.assertEqual(modes.parse_choice(prompt), expected)
+            self.assertIsNone(modes.parse_choice(prompt, awaiting=False))
+        for prompt in ['2个问题，修复一下', '1. 修复文件', '1、2 都行', '2? 然后执行']:
+            self.assertIsNone(modes.parse_choice(prompt))
+        self.hook('UserPromptSubmit', prompt='2，然后修复问题并 push')
+        self.assertEqual(self.store.get(self.session)['selection_source'], 'explicit_user_prompt')
+
+    def test_pretool_recovers_rebound_session_from_history_without_prompt_hook(self):
+        self.store.submitted('old-session', '模式二', [])
+        self.hook('SessionStart')
+        self.assertIsNone(self.store.get(self.session)['mode'])
+        out = self.hook('PreToolUse', tool_name='Read', tool_input={'file_path': '/x'})
+        self.assertNotIn('permissionDecision', out['hookSpecificOutput'])
+        self.assertIn(self.session, out['hookSpecificOutput']['additionalContext'])
+        self.assertEqual(self.store.get(self.session)['mode'], '2')
+        self.store.submitted('another-session', '模式一', [])
+        self.assertEqual(self.hook('PreToolUse', tool_name='Read', tool_input={}), {})
+        self.assertEqual(self.store.get(self.session)['mode'], '2')
+        denied = self.hook('PreToolUse', tool_name='Bash', tool_input={'command': 'codex exec work'})
+        self.assertEqual(denied['hookSpecificOutput']['permissionDecision'], 'deny')
+
+    def test_pretool_recovers_actual_transcript_choice_before_global_preference(self):
+        self.store.submitted('previous', '模式一', [])
+        path = self.transcript([self.user_record('2，然后修复问题')])
+        with patch.object(ccl, 'find_transcript', return_value=path):
+            out = self.hook('PreToolUse', tool_name='Read', tool_input={})
+        self.assertNotIn('permissionDecision', out['hookSpecificOutput'])
+        state = self.store.get(self.session)
+        self.assertEqual(state['mode'], '2')
+        self.assertEqual(state['selection_evidence']['source'], 'user_prompt')
+
+    def test_pretool_never_reopens_finished_task_without_new_human_input(self):
+        self.store.submitted(self.session, '模式二', [])
+        with patch.object(modes, 'now', return_value='2026-01-01T00:00:02.000Z'):
+            self.store.finish(self.session, 'done', [])
+        path = self.transcript([self.user_record('模式二'),
+            self.user_record('模式一', '2026-01-01T00:00:03.000Z', isMeta=True)])
+        with patch.object(ccl, 'find_transcript', return_value=path):
+            out = self.hook('PreToolUse', tool_name='Read', tool_input={})
+        self.assertEqual(out['hookSpecificOutput']['permissionDecision'], 'deny')
+        self.assertIn(self.session, out['hookSpecificOutput']['permissionDecisionReason'])
+        self.assertIsNone(self.store.get(self.session)['mode'])
+        path = self.transcript([self.user_record('接下来检查文件', '2026-01-01T00:00:04.000Z')])
+        with patch.object(ccl, 'find_transcript', return_value=path):
+            out = self.hook('PreToolUse', tool_name='Read', tool_input={})
+        self.assertNotIn('permissionDecision', out['hookSpecificOutput'])
+        self.assertEqual(self.store.get(self.session)['mode'], '2')
+
+    def test_recovery_does_not_replace_pending_handoff_or_choose_without_evidence(self):
+        self.store.submitted(self.session, '模式一', [])
+        self.store.submitted(self.session, '模式二', [{'id': 'running'}])
+        self.store.recover_for_tool(self.session, None, [])
+        self.assertEqual(self.store.get(self.session)['pending_mode'], '2')
+        self.assertIsNone(self.store.recover_for_tool('new-without-history', None, [])['pending_mode'])
+        fresh = modes.ModeStore(self.project/'fresh-state')
+        self.assertIsNone(fresh.recover_for_tool('first-ever', None, [])['mode'])
+
+    def test_module_nonhuman_and_meta_prompts_do_not_select_or_advance(self):
+        for origin in [{'kind': 'plugin'}, {'kind': 'peer'}, None, 'human']:
+            self.hook('UserPromptSubmit', prompt='模式二', origin=origin)
+        self.hook('UserPromptSubmit', prompt='模式二', origin={'kind': 'human'}, isMeta=True)
+        state = self.store.get(self.session)
+        self.assertIsNone(state['mode'])
+        self.assertEqual(state['turn'], 0)
+        self.hook('UserPromptSubmit', prompt='2，然后继续', origin={'kind': 'human'})
+        self.assertEqual(self.store.get(self.session)['mode'], '2')
+
     def test_choice_with_task_and_persistence_during_clarification(self):
         self.hook('UserPromptSubmit',prompt='模式二：修改文件')
         self.store.begin(self.session,self.project,'edit')

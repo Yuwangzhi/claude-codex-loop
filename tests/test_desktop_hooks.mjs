@@ -1,106 +1,168 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { register } from '../desktop-plugin/hooks/hooks.mjs';
 
-function harness(output = {}, downstream = {}) {
+function harness(output = {}, downstream = { result: {} }) {
   const handlers = new Map();
-  register((name, hook) => {
-    const entry = { hook };
-    handlers.set(name, entry);
-    return { catch: (handler) => { entry.fail = handler; } };
-  });
-  const calls = [];
-  const logs = [];
+  register((name, hook) => handlers.set(name, hook));
+  const calls = [], logs = [], entered = [];
+  let session = 'session-123';
   const api = {
     plugin: { root: '/plugins/ccl with spaces' },
     fs: { read: async () => JSON.stringify({ python: '/Python Path/python', ccl: '/CCL Path/ccl.py' }) },
-    process: { run: async (...args) => { calls.push(args); return { exitCode: 0, stdout: JSON.stringify(output) }; } },
-    session: { id: async () => 'session-123', cwd: async () => '/project with spaces' },
-    ui: { log: (text) => logs.push(text) },
+    process: { run: async (...args) => {
+      calls.push(args);
+      const response = typeof output === 'function' ? output(JSON.parse(args[1].stdin)) : output;
+      return { exitCode: 0, stdout: JSON.stringify(response) };
+    } },
+    session: { id: async () => session, cwd: async () => '/project with spaces' },
+    ui: { log: text => logs.push(text) },
   };
-  let nextCalls = 0;
-  const next = async () => { nextCalls += 1; return downstream; };
-  return { handlers, api, calls, logs, next, nextCalls: () => nextCalls };
+  const next = async event => { entered.push(event); return downstream; };
+  return { handlers, api, calls, logs, entered, next, setSession: value => { session = value; } };
 }
+const human = text => ({ text, origin: { kind: 'human' }, wait: false });
+const payloads = h => h.calls.map(call => JSON.parse(call[1].stdin));
 
-test('registers all five lifecycle events with failure handlers', () => {
-  const h = harness();
-  assert.deepEqual([...h.handlers.keys()], [
-    'classic.SessionStart', 'classic.UserPromptSubmit', 'classic.PostToolUse', 'classic.PreToolUse', 'classic.Stop',
-  ]);
-  for (const handler of h.handlers.values()) assert.equal(typeof handler.fail, 'function');
+test('registers the current native lifecycle events', () => {
+  assert.deepEqual([...harness().handlers.keys()], ['session.start', 'prompt.submit', 'tool.call', 'turn.complete']);
 });
 
-test('prompt payload goes only to stdin and contexts from other hooks survive', async () => {
-  const h = harness({ hookSpecificOutput: { additionalContext: 'CCL context' } }, { additionalContext: ['other context'], block: 'other block' });
-  const event = { hook_event_name: 'UserPromptSubmit', session_id: 's', cwd: '/project', prompt: '1; $(touch unsafe)' };
-  const result = await h.handlers.get('classic.UserPromptSubmit').hook(h.api, event, h.next);
+test('attaches contexts before next enters the prompt, without changing human text', async () => {
+  const h = harness(p => ({ hookSpecificOutput: { additionalContext: p.hook_event_name } }), { text: 'accepted' });
+  const event = { ...human('2; $(touch unsafe)'), context: ['other context'] };
+  const result = await h.handlers.get('prompt.submit')(h.api, event, h.next);
   assert.deepEqual(h.calls[0][0], ['/Python Path/python', '/CCL Path/ccl.py', 'hook']);
-  assert.deepEqual(JSON.parse(h.calls[0][1].stdin), { ...event, ccl_transport: 'module' });
   assert.equal(h.calls[0][1].timeoutMs, 8000);
-  assert.deepEqual(result.additionalContext, ['other context', 'CCL context']);
-  assert.equal(result.block, 'other block');
-  assert.equal(h.nextCalls(), 1);
-  assert.deepEqual(h.logs, []);
+  assert.equal(payloads(h)[1].prompt, event.text);
+  assert.equal(payloads(h)[1].ccl_transport, 'module');
+  assert.deepEqual(h.entered[0], { ...event, context: ['other context', 'SessionStart', 'UserPromptSubmit'] });
+  assert.deepEqual(result, { text: 'accepted' });
 });
 
-test('converts the mod PreToolUse envelope and retains both denials', async () => {
-  const h = harness({ hookSpecificOutput: { permissionDecision: 'deny', permissionDecisionReason: 'select mode' } }, { deny: 'policy denial', additionalContext: ['policy context'] });
-  const result = await h.handlers.get('classic.PreToolUse').hook(h.api, { tool: 'Bash', tool_use_id: 't1', command: 'echo ok' }, h.next);
-  assert.deepEqual(JSON.parse(h.calls[0][1].stdin), {
-    hook_event_name: 'PreToolUse', session_id: 'session-123', cwd: '/project with spaces',
-    tool_name: 'Bash', tool_use_id: 't1', tool_input: { command: 'echo ok' }, ccl_transport: 'module',
-  });
-  assert.equal(result.deny, 'policy denial\nselect mode');
-  assert.deepEqual(result.additionalContext, ['policy context']);
-  assert.equal(h.nextCalls(), 1);
+test('preserves a downstream prompt drop and never invents accepted text', async () => {
+  const h = harness({}, { drop: 'policy declined' });
+  assert.deepEqual(await h.handlers.get('prompt.submit')(h.api, human('2'), h.next), { drop: 'policy declined' });
 });
 
-test('CCL denial removes an allow; CCL pass preserves a later ask', async () => {
-  const h = harness({ hookSpecificOutput: { permissionDecision: 'deny', permissionDecisionReason: 'mode' } }, { allow: true });
-  const entry = h.handlers.get('classic.PreToolUse');
-  assert.deepEqual(await entry.hook(h.api, { tool: 'Read', file_path: '/x' }, h.next), { deny: 'mode' });
-  const pass = harness({}, { ask: 'user consent needed' });
-  assert.deepEqual(await pass.handlers.get('classic.PreToolUse').hook(pass.api, { tool: 'Read', file_path: '/x' }, pass.next), { ask: 'user consent needed' });
+test('non-human and meta prompts do not change the mode', async () => {
+  for (const event of [{ text: '模式一', origin: { kind: 'plugin' } }, { ...human('模式一'), isMeta: true }]) {
+    const h = harness();
+    await h.handlers.get('prompt.submit')(h.api, event, h.next);
+    assert.equal(h.calls.length, 0);
+    assert.deepEqual(h.entered, [event]);
+  }
 });
 
-test('process failure and malformed/truncated output fail closed at PreToolUse', async () => {
-  for (const result of [{ exitCode: 1, stdout: '{}' }, { exitCode: 0, stdout: 'not json' }, { exitCode: 0, stdout: '[]' }, { exitCode: 0, stdout: '{}', isStdoutTruncated: true }]) {
+test('starts once per registration and detects an ID change without session.start', async () => {
+  const h = harness();
+  await h.handlers.get('session.start')(h.api, {}, h.next);
+  await h.handlers.get('prompt.submit')(h.api, human('2'), h.next);
+  h.setSession('resumed-session');
+  await h.handlers.get('tool.call')(h.api, { tool: 'Read', file_path: '/x' }, h.next);
+  assert.deepEqual(payloads(h).map(p => [p.hook_event_name, p.session_id]), [
+    ['SessionStart', 'session-123'], ['UserPromptSubmit', 'session-123'],
+    ['SessionStart', 'resumed-session'], ['PreToolUse', 'resumed-session'],
+  ]);
+  const other = harness();
+  await other.handlers.get('prompt.submit')(other.api, human('1'), other.next);
+  assert.equal(payloads(other)[0].hook_event_name, 'SessionStart');
+});
+
+test('concurrent tool calls share initialization but not their payloads', async () => {
+  const h = harness();
+  await Promise.all(['a', 'b'].map(file_path => h.handlers.get('tool.call')(h.api, { tool: 'Read', file_path }, h.next)));
+  assert.equal(payloads(h).filter(p => p.hook_event_name === 'SessionStart').length, 1);
+  assert.equal(payloads(h).filter(p => p.hook_event_name === 'PreToolUse').length, 2);
+});
+
+test('denial prevents execution; passes retain downstream results and context', async () => {
+  const h = harness(p => p.hook_event_name === 'PreToolUse'
+    ? { hookSpecificOutput: { permissionDecision: 'deny', permissionDecisionReason: 'select mode' } } : {});
+  assert.deepEqual(await h.handlers.get('tool.call')(h.api, { tool: 'Bash', tool_use_id: 't1', command: 'true' }, h.next), { deny: 'select mode' });
+  assert.equal(h.entered.length, 0);
+  assert.deepEqual(payloads(h)[1].tool_input, { command: 'true' });
+  const pass = harness(p => p.hook_event_name === 'PreToolUse'
+    ? { hookSpecificOutput: { additionalContext: 'recovered current session' } } : {},
+  { result: { value: 1 }, ref: 7, context: ['policy context'] });
+  assert.deepEqual(await pass.handlers.get('tool.call')(pass.api, { tool: 'Read', file_path: '/x' }, pass.next),
+    { result: { value: 1 }, ref: 7, context: ['policy context', 'recovered current session'] });
+  const denied = harness({}, { deny: 'downstream permission refusal' });
+  assert.deepEqual(await denied.handlers.get('tool.call')(denied.api, { tool: 'Read' }, denied.next), { deny: 'downstream permission refusal' });
+});
+
+test('process failures fail closed, and a transient initialization failure can retry', async () => {
+  for (const result of [{ exitCode: 1, stdout: '{}' }, { exitCode: 0, stdout: 'not json' },
+    { exitCode: 0, stdout: '[]' }, { exitCode: 0, stdout: '{}', isStdoutTruncated: true }]) {
     const h = harness();
     h.api.process.run = async () => result;
-    const entry = h.handlers.get('classic.PreToolUse');
-    await assert.rejects(entry.hook(h.api, { tool: 'Bash', command: 'echo ok' }, h.next));
-    assert.equal(typeof entry.fail().deny, 'string');
-    assert.equal(h.nextCalls(), 0);
+    assert.equal(typeof (await h.handlers.get('tool.call')(h.api, { tool: 'Read' }, h.next)).deny, 'string');
+    assert.equal(h.entered.length, 0);
+    h.api.process.run = async () => ({ exitCode: 0, stdout: '{}' });
+    assert.deepEqual(await h.handlers.get('tool.call')(h.api, { tool: 'Read' }, h.next), { result: {} });
   }
-  const h = harness();
-  h.api.process.run = async () => { throw new Error('timeout'); };
-  await assert.rejects(h.handlers.get('classic.PreToolUse').hook(h.api, { tool: 'Bash' }, h.next));
-  assert.equal(h.nextCalls(), 0);
 });
 
-test('Stop keeps all blocking and continuation decisions', async () => {
-  const h = harness({ decision: 'block', reason: 'CCL still active' }, { block: 'other still active', preventContinuation: true, stopReason: 'other stopped' });
-  const result = await h.handlers.get('classic.Stop').hook(h.api, { hook_event_name: 'Stop', cwd: '/project', session_id: 's' }, h.next);
-  assert.deepEqual(result, { block: 'other still active\nCCL still active', preventContinuation: true, stopReason: 'other stopped' });
+test('records an actual AskUserQuestion result after execution, never a denial or error', async () => {
+  const answer = { answers: { '模式1还是模式2？': '模式二：仅 Claude' } };
+  const h = harness({}, { result: answer, ref: 9 });
+  const input = { tool: 'AskUserQuestion', questions: [{ question: '模式1还是模式2？' }] };
+  await h.handlers.get('tool.call')(h.api, input, h.next);
+  const post = payloads(h).at(-1);
+  assert.equal(post.hook_event_name, 'PostToolUse');
+  assert.deepEqual(post.tool_response, answer);
+  assert.deepEqual(post.tool_input, { questions: input.questions });
+  for (const downstream of [{ deny: 'no' }, { isError: true, result: 'cancelled' }]) {
+    const failed = harness({}, downstream);
+    await failed.handlers.get('tool.call')(failed.api, input, failed.next);
+    assert.equal(payloads(failed).some(p => p.hook_event_name === 'PostToolUse'), false);
+  }
 });
 
-test('only question answers use the PostToolUse process bridge', async () => {
-  const h = harness();
-  const entry = h.handlers.get('classic.PostToolUse');
-  await entry.hook(h.api, { tool_name: 'Read' }, h.next);
-  assert.equal(h.calls.length, 0);
-  await entry.hook(h.api, { hook_event_name: 'PostToolUse', tool_name: 'AskUserQuestion' }, h.next);
-  assert.equal(h.calls.length, 1);
-  assert.equal(h.nextCalls(), 2);
+test('turn completion reports the actual final text without spawning a turn', async () => {
+  const h = harness({ decision: 'block', reason: 'finish your mode task' }, { text: 'done' });
+  assert.deepEqual(await h.handlers.get('turn.complete')(h.api, { text: 'done' }, h.next), { text: 'done' });
+  assert.equal(payloads(h)[0].last_assistant_message, 'done');
+  assert.deepEqual(h.logs, ['finish your mode task']);
+  const child = harness();
+  await child.handlers.get('turn.complete')(child.api, { text: 'child done', agentId: 'agent' }, child.next);
+  assert.equal(child.calls.length, 0);
 });
 
-test('Stop failure blocks once and prompt failure retains downstream context', async () => {
-  const h = harness({}, { additionalContext: ['other'] });
-  const entry = h.handlers.get('classic.Stop');
-  assert.equal(typeof (await entry.fail(h.api, { stop_hook_active: false }, h.next)).block, 'string');
-  assert.deepEqual(await entry.fail(h.api, { stop_hook_active: true }, h.next), { additionalContext: ['other'] });
-  const prompt = await h.handlers.get('classic.UserPromptSubmit').fail(h.api, {}, h.next);
-  assert.equal(prompt.additionalContext[0], 'other');
-  assert.equal(prompt.additionalContext.length, 2);
+test('real Python bridge: a resumed session recovers its choice without another prompt', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'ccl-native-recovery-'));
+  try {
+    const script = fileURLToPath(new URL('../ccl.py', import.meta.url));
+    const state = join(root, 'state');
+    const h = harness({}, { result: { ok: true } });
+    h.api.session.cwd = async () => root;
+    h.api.process.run = async (argv, options) => {
+      const result = spawnSync(process.env.PYTHON || 'python3', [script, 'hook'], {
+        encoding: 'utf8', input: options.stdin, cwd: root,
+        env: { ...process.env, CCL_STATE_DIR: state, CCL_CONFIG_DIR: join(root, 'config'), CLAUDE_CONFIG_DIR: join(root, 'claude') },
+      });
+      assert.equal(result.status, 0, result.stderr);
+      return { exitCode: result.status, stdout: result.stdout };
+    };
+    await h.handlers.get('prompt.submit')(h.api, human('2，然后修复问题'), h.next);
+    h.setSession('resumed-without-prompt');
+    const result = await h.handlers.get('tool.call')(h.api, { tool: 'Read', file_path: '/x' }, h.next);
+    assert.equal(result.deny, undefined);
+    assert.ok(result.context.some(text => text.includes('resumed-without-prompt')));
+    const saved = JSON.parse(readFileSync(join(state, 'sessions/resumed-without-prompt.json'), 'utf8'));
+    assert.equal(saved.mode, '2');
+    assert.equal(saved.selection_source, 'default_last_mode');
+    const denied = await h.handlers.get('tool.call')(h.api, { tool: 'Bash', command: 'codex exec test' }, h.next);
+    assert.match(denied.deny, /模式二/);
+    writeFileSync(join(state, 'mode-preference.json'), JSON.stringify({ mode: '1' }));
+    await h.handlers.get('tool.call')(h.api, { tool: 'Read', file_path: '/x' }, h.next);
+    assert.equal(JSON.parse(readFileSync(join(state, 'sessions/resumed-without-prompt.json'), 'utf8')).mode, '2');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

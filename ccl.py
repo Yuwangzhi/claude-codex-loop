@@ -21,7 +21,7 @@ import compatibility
 import contextpack
 import governance
 
-VERSION = "0.4.0"
+VERSION = "0.4.3"
 STATE = Path(os.environ.get("CCL_STATE_DIR", str(Path.home() / ".local/state/claude-codex-loop"))).expanduser()
 CONFIG = Path(os.environ.get("CCL_CONFIG_DIR", str(Path.home() / ".config/claude-codex-loop"))).expanduser()
 TERMINAL = {"accepted", "cancelled"}
@@ -981,6 +981,11 @@ def hook(payload):
                 "共享记忆: " + str(project / ".ai-collab/MEMORY.md") + "；全局约定: " + str(CONFIG / "SHARED_MEMORY.md") +
                 "。不把未验收说成完成。当前项目未关闭任务: " + dump(info)}}
     if event == "UserPromptSubmit":
+        # Module prompts also include notifications, peer messages and plugins.
+        # They are not new user choices and must not advance mode state.
+        if payload.get("isMeta") or ("origin" in payload and
+                (not isinstance(payload["origin"], dict) or payload["origin"].get("kind") != "human")):
+            return {}
         state = store.submitted(session, payload.get("prompt", ""), own)
         access = (" 本机可选的访问与权限交接: " + str(CONFIG / "ACCESS_HANDOFF.md") +
                   "；遇到访问或工具审批问题时按需读取。") if (CONFIG / "ACCESS_HANDOFF.md").is_file() else ""
@@ -1005,7 +1010,24 @@ def hook(payload):
             return {"hookSpecificOutput": {"hookEventName": event, "additionalContext": store.guidance(state)}}
         return {}
     if event == "PreToolUse":
-        return store.pretool(session, payload.get("tool_name", ""), payload.get("tool_input", {}))
+        tool, args = payload.get("tool_name", ""), payload.get("tool_input", {})
+        recovered = False
+        if (not store.get(session)["mode"] and tool not in modes.DESKTOP_METADATA_TOOLS and
+                tool not in ("Skill", "AskUserQuestion") and not
+                (tool in ("Bash", "PowerShell") and modes.control_command(args.get("command", "")))):
+            transcript = None
+            try:
+                transcript = find_transcript(session)
+            except ValueError:
+                pass  # A fresh host can bind a session before writing its transcript.
+            state = store.recover_for_tool(session, transcript, own)
+            recovered = bool(state["mode"] or state.get("pending_mode"))
+        output = store.pretool(session, tool, args)
+        if recovered:
+            specific = output.setdefault("hookSpecificOutput", {"hookEventName": event})
+            specific["additionalContext"] = ("CCL 已恢复当前 hook session=" + session + "；" +
+                                             store.guidance(store.get(session)))
+        return output
     if event == "Stop" and not payload.get("stop_hook_active"):
         mode_state = store.get(session)
         if mode_state.get("pending_mode"):
