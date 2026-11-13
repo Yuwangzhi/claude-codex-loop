@@ -54,7 +54,8 @@ class InstallTests(unittest.TestCase):
         self.assertEqual((self.prefix / 'ccl.py').read_bytes(), (install.SOURCE / 'ccl.py').read_bytes())
         command = ['cmd', '/d', '/c', str(self.bin.with_suffix('.cmd')), '--version'] if os.name == 'nt' else [str(self.bin), '--version']
         result = subprocess.run(command, capture_output=True, text=True, check=True)
-        self.assertEqual(result.stdout.strip(), '0.4.0')
+        manifest = json.loads((install.SOURCE / 'desktop-plugin/.claude-plugin/plugin.json').read_text())
+        self.assertEqual(result.stdout.strip(), manifest['version'])
         self.assertNotIn('@CCL@', (folder / 'skills/codex-loop/SKILL.md').read_text())
         self.assertNotIn(b'\r\n', self.bin.read_bytes())
 

@@ -36,6 +36,8 @@ description: 在 Claude Code 开始任务、切换模式、结束任务时管理
 - hook 没有记录用户的选择（桌面端有时漏记）：`@CCL@ mode sync --session '${CLAUDE_SESSION_ID}'` 从真实会话记录恢复。它是只读恢复，**不要用模型文字伪造选择**。命令里不要加管道或 `;`（旧版门禁会拒绝，新版已不拦）。
 - 安装/任务记录异常：`@CCL@ doctor --project /abs/project --session '${CLAUDE_SESSION_ID}'`（只读）。
 
+会话恢复、分叉或清空后，真实 session ID 可能改变。若 hook 没记录当前输入，先用**当前真实 ID** 运行 `mode sync`；不要反复同步旧 ID，也不要让用户重输已经给过的选择。工具入口会在缺失状态时从当前会话记录或上次模式恢复；通知、插件消息、工具结果等非 human 输入不算用户选择。已结束的任务只有收到新的真实用户输入才重开；支持 `2，然后修复问题` 这种模式与任务同句输入。
+
 ## 两条路径
 
 - **模式一**：加载 `codex-loop`。每个 CCL 任务绑定当前 session；续接旧 session 的任务先检查现场再 `ccl adopt TASK_ID --session ...`，不要复制创建相同任务。

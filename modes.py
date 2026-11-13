@@ -60,7 +60,7 @@ def parse_choice(prompt, awaiting=True):
         return None
     # Bare answers are accepted only while a menu is open. Do not scan arbitrary
     # task content for digits (e.g. "修复 2 个错误" / "看一下" / "运行 1 次").
-    match = re.fullmatch(prefix + verb + r"([12一二])(?:\s*(?:吧|啊|呀|呢|好了|就行|即可|都行|可以|模式|的))*[\s，,。.!！~～]*", text)
+    match = re.fullmatch(prefix + verb + r"([12一二])(?:\s*(?:吧|啊|呀|呢|好了|就行|即可|都行|可以|模式|的))*[\s，,。.!！~～]*", clause)
     if match:
         return DIGITS[match.group(1)]
     return None
@@ -68,6 +68,28 @@ def parse_choice(prompt, awaiting=True):
 
 def now():
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def human_prompt(record):
+    """Only the host's human-origin text is evidence of a user request."""
+    message = record.get("message")
+    origin = record.get("origin")
+    return (record.get("type") == "user" and not record.get("isMeta") and
+            isinstance(origin, dict) and origin.get("kind") == "human" and
+            isinstance(message, dict) and isinstance(message.get("content"), str))
+
+
+def transcript_has_prompt(path, since):
+    with open(path, encoding="utf-8", errors="replace") as stream:
+        for line in stream:
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if (isinstance(record, dict) and human_prompt(record) and
+                    record.get("timestamp", "") > since):
+                return True
+    return False
 
 
 def transcript_choices(path, since=None, defaulted=False):
@@ -105,7 +127,7 @@ def transcript_choices(path, since=None, defaulted=False):
                             defaulted = False
                 menu_open = False
                 continue
-            if (record.get("origin") or {}).get("kind") == "human" and isinstance(content, str):
+            if human_prompt(record):
                 choice = parse_choice(content, menu_open or defaulted)
                 menu_open = False
                 if choice:
@@ -296,6 +318,30 @@ class ModeStore:
                 state["selection_evidence"] = dict(found[-1], transcript=str(transcript))
                 self.remember_choice(state)
             state["synced_at"] = now()
+        return self.get(session)
+
+    def recover_for_tool(self, session, transcript, open_tasks):
+        """Recover the actual hook session after a resume/rebind lost prompt hooks.
+
+        Never borrow another session's active task or change a selected mode.
+        A finished task needs a newer human prompt before it can reopen.
+        """
+        with self.edit(session) as state:
+            if state["mode"] or state.get("pending_mode"):
+                return state
+            finished = state.get("finished_at")
+            if finished and (transcript is None or not transcript_has_prompt(transcript, finished)):
+                return state
+            fallback = self.fallback_mode(state)
+            found = transcript_choices(transcript, finished, defaulted=bool(fallback)) if transcript else []
+            if found:
+                self.apply_choice(state, found[-1]["choice"], open_tasks, "transcript_sync")
+                state["selection_evidence"] = dict(found[-1], transcript=str(transcript))
+                self.remember_choice(state)
+            elif fallback:
+                self.apply_choice(state, fallback, open_tasks, "default_last_mode")
+            if state["mode"] or state.get("pending_mode"):
+                state["recovered_at"] = now()
         return self.get(session)
 
     def activate(self, session, open_tasks):

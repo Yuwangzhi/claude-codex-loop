@@ -10,6 +10,16 @@ A local, two-mode workflow for Claude Code and Codex CLI: plan → execute → v
 
 **用户指定模式就照办，没指定就由 Claude 按任务难度自己选，不反问。** 适合 Claude 额度较少、Codex 额度较多的个人工作流；实际额度消耗取决于任务规模，不承诺固定节省比例。
 
+## v0.4.4：自动选择 + 模式恢复
+
+- 用户明确选择仍严格照办；未指定时按任务难度自选，不再因缺少选择拦截工具。
+- 会话恢复、分叉或清空导致 session ID 改变时，工具入口按**当前真实 session** 从会话记录或上次模式恢复，避免同步旧 ID 的循环。
+- 通知、插件消息和工具结果不算用户选择；支持 `2，然后修复问题` 同句输入。
+- 原生模块在 `next(event)` 之前注入模式提示，并在真实 `AskUserQuestion` 之后记录答案；已结束任务需要新的真实用户输入才重开。
+- 保留 0.4.0+ 的启动重试、验收脚本预编译和 Windows 路径错误提示。
+
+回归范围见 [模式恢复验证记录](docs/mode-recovery-validation-20261113.md)；行为说明见 [执行模式](docs/modes.md)。
+
 ## 两种模式
 
 | 模式 | Claude | Codex |
