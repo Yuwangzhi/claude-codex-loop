@@ -42,12 +42,15 @@ ccl --version
 
 重开 Claude Code 会话后直接说任务，例如“模式一：修复 CSV 导入错误并补回归测试”。环境要求、桌面端 hooks、Windows 与卸载见 [安装与卸载](docs/install.md)。
 
+Windows 与 macOS 的 hooks 通路和安装产物不同。升级时要整套替换模块，只换 `ccl.py` 会让 hook 调用 `modes.py` 中不存在的方法，并在客户端显示成“安装检查失败”。原因、探针和排查顺序见 [Windows 与 macOS](docs/windows-macos.md)。
+
 ## 文档
 
 | 文档 | 内容 |
 | --- | --- |
 | [执行模式](docs/modes.md) | 选模式规则、对话示例、`ccl mode sync` |
 | [安装与卸载](docs/install.md) | 环境、安装、桌面端 hooks 通路、安装内容与卸载 |
+| [Windows 与 macOS](docs/windows-macos.md) | 部署差异、版本一致性、模块异常排查 |
 | [权限](docs/permissions.md) | 为什么不逐条 Yes/No、沙箱与审批设置 |
 | [执行闭环](docs/loop.md) | 派发 → 检查 → 返修 → 验收，中断与切换 |
 | [共享记忆](docs/memory.md) | `.ai-collab/MEMORY.md` 与候选知识 |
